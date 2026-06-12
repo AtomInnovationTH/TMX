@@ -143,6 +143,15 @@
     padding: 6px 14px; border-radius: 999px; cursor: pointer;
     box-shadow: 0 2px 12px rgba(0,0,0,.25);
   }
+
+  /* Radar */
+  #radarwrap { display: none; justify-content: center; padding: 12px 16px 0; flex: 0 0 auto; }
+  #radarwrap.show { display: flex; }
+  #radar {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 10px 14px; text-align: center;
+  }
+  #radar .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -151,6 +160,7 @@
   <h1>LoRa Chat <small id="subtitle">LightTracker · 923.2 MHz</small></h1>
   <span class="pill" id="gpspill" title="Your LightTracker's GPS">GPS —</span>
   <span class="pill"><span class="dot" id="dot"></span><span id="status">Disconnected</span></span>
+  <button class="ghost" id="radarBtn" style="display:none">📡 Radar</button>
   <button class="ghost" id="reconnect" style="display:none">Reconnect</button>
 </header>
 
@@ -173,6 +183,12 @@
 </div>
 
 <div id="chat">
+  <div id="radarwrap">
+    <div id="radar">
+      <svg id="radarSvg" width="250" height="250" role="img" aria-label="Range and direction radar"></svg>
+      <div class="meta" id="radarMsg"></div>
+    </div>
+  </div>
   <div id="log" aria-live="polite"></div>
   <div id="composer">
     <div class="inputwrap">
@@ -199,6 +215,8 @@ const els = {
   dot: $("dot"), status: $("status"), reconnect: $("reconnect"),
   text: $("text"), send: $("send"), count: $("count"),
   newmsgs: $("newmsgs"), subtitle: $("subtitle"), gpspill: $("gpspill"),
+  radarBtn: $("radarBtn"), radarwrap: $("radarwrap"),
+  radarSvg: $("radarSvg"), radarMsg: $("radarMsg"),
 };
 
 let port = null, reader = null, writer = null;
@@ -253,6 +271,94 @@ function describePeerPos(pos) {
   }
   if (pos.batt > 0.5) parts.push(`🔋 ${pos.batt} V`);
   return parts.length ? parts.join("  ·  ") : null;
+}
+
+// ---------- Radar (range circle: distance + direction, north up) ----------
+const peers = new Map();   // name -> {lat, lon, alt, batt, ts}
+let radarOn = localStorage.getItem("lorachat.radar") !== "0";  // default on
+const SVGNS = "http://www.w3.org/2000/svg";
+const PEER_TTL_MS = 15 * 60000;   // drop peers not heard from in 15 min
+
+function notePeer(from, pos) {
+  if (pos && pos.sats > 0) {
+    peers.set(from, { lat: pos.lat, lon: pos.lon, alt: pos.alt, batt: pos.batt, ts: Date.now() });
+    drawRadar();
+  }
+}
+
+function svgEl(tag, attrs, text) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function niceScale(m) {
+  const steps = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000];
+  for (const s of steps) if (m <= s) return s;
+  return Math.ceil(m / 100000) * 100000;
+}
+
+function drawRadar() {
+  if (!radarOn) return;
+  const svg = els.radarSvg;
+  svg.replaceChildren();
+  const W = 250, C = W / 2, R = C - 22;
+  const grid = "stroke:var(--border);fill:none";
+  const label = "fill:var(--muted);font-size:10px";
+
+  for (const f of [0.5, 1]) svg.appendChild(svgEl("circle", { cx: C, cy: C, r: R * f, style: grid }));
+  svg.appendChild(svgEl("line", { x1: C, y1: C - R, x2: C, y2: C + R, style: grid }));
+  svg.appendChild(svgEl("line", { x1: C - R, y1: C, x2: C + R, y2: C, style: grid }));
+  svg.appendChild(svgEl("text", { x: C, y: C - R - 6, "text-anchor": "middle", style: label }, "N"));
+  svg.appendChild(svgEl("text", { x: C + R + 7, y: C + 3, style: label }, "E"));
+  svg.appendChild(svgEl("text", { x: C, y: C + R + 14, "text-anchor": "middle", style: label }, "S"));
+  svg.appendChild(svgEl("text", { x: C - R - 16, y: C + 3, style: label }, "W"));
+
+  // expire stale peers
+  const now = Date.now();
+  for (const [name, p] of peers) if (now - p.ts > PEER_TTL_MS) peers.delete(name);
+
+  if (!myPos) {
+    els.radarMsg.textContent = "Waiting for your GPS fix…";
+    return;
+  }
+
+  const plotted = [...peers.entries()].map(([name, p]) => ({
+    name, p, d: haversineM(myPos, p), b: bearingDeg(myPos, p),
+  }));
+  const scale = niceScale(Math.max(100, ...plotted.map(x => x.d * 1.15)));
+
+  // ring distance labels
+  svg.appendChild(svgEl("text", { x: C + 4, y: C - R / 2 - 3, style: label }, fmtDistance(scale / 2)));
+  svg.appendChild(svgEl("text", { x: C + 4, y: C - R + 11, style: label }, fmtDistance(scale)));
+
+  // me, at the center
+  svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5, style: "fill:var(--accent)" }));
+
+  for (const { name, p, d, b } of plotted) {
+    const r = Math.min(d / scale, 1) * R;
+    const x = C + Math.sin(b * Math.PI / 180) * r;
+    const y = C - Math.cos(b * Math.PI / 180) * r;
+    const age = now - p.ts;
+    const g = svgEl("g", { opacity: age > 120000 ? 0.5 : 1 });
+    g.appendChild(svgEl("circle", { cx: x, cy: y, r: 5, style: "fill:var(--ok)" }));
+    g.appendChild(svgEl("text", { x, y: y - 9, "text-anchor": "middle",
+      style: "fill:var(--text);font-size:11px;font-weight:600" }, name));
+    const sub = fmtDistance(d) + (age > 60000 ? ` · ${Math.round(age / 60000)} min ago` : "");
+    g.appendChild(svgEl("text", { x, y: y + 17, "text-anchor": "middle", style: label }, sub));
+    svg.appendChild(g);
+  }
+
+  els.radarMsg.textContent = plotted.length
+    ? `North up · outer ring ${fmtDistance(scale)}`
+    : "Peers appear here when their messages arrive";
+}
+
+function applyRadarVisibility() {
+  els.radarwrap.classList.toggle("show", radarOn);
+  els.radarBtn.textContent = radarOn ? "📡 Radar on" : "📡 Radar";
+  if (radarOn) drawRadar();
 }
 
 // ---------- UI helpers ----------
@@ -356,12 +462,14 @@ function handleBoardEvent(m) {
       break;
     case "rx":
       addMessage({ mine: false, from: m.from, text: m.text, rssi: m.rssi, snr: m.snr, pos: m.pos });
+      notePeer(m.from, m.pos);
       break;
     case "join": {
       let line = `${m.from} joined the chat  (${m.rssi} dBm)`;
       const where = describePeerPos(m.pos);
       if (where) line += `  ·  ${where}`;
       addSystem(line);
+      notePeer(m.from, m.pos);
       break;
     }
     case "gps":
@@ -374,6 +482,7 @@ function handleBoardEvent(m) {
         els.gpspill.textContent = "GPS no fix";
         els.gpspill.title = `Searching for satellites… · battery ${m.batt} V`;
       }
+      if (radarOn) drawRadar();
       break;
     case "sent": setDelivery(m.id, "✓ sent"); break;
     case "ack":  setDelivery(m.id, "✓✓ delivered"); break;
@@ -458,6 +567,8 @@ async function connectFlow(interactive) {
 function showChat() {
   els.hero.style.display = "none";
   els.chat.style.display = "flex";
+  els.radarBtn.style.display = "inline-block";
+  applyRadarVisibility();
   els.text.focus();
 }
 
@@ -490,6 +601,12 @@ els.nameInput.addEventListener("keydown", e => {
 els.reconnect.addEventListener("click", async () => {
   if (!(await connectFlow(false))) connectFlow(true);
 });
+els.radarBtn.addEventListener("click", () => {
+  radarOn = !radarOn;
+  localStorage.setItem("lorachat.radar", radarOn ? "1" : "0");
+  applyRadarVisibility();
+});
+setInterval(() => { if (radarOn && connected) drawRadar(); }, 10000); // age labels
 
 if (!("serial" in navigator)) {
   els.connectCard.style.display = "none";
