@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:;">
+<title>LightTracker LoRa Chat</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --text: #1a1d21;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-text: #ffffff;
+    --bubble-them: #e5e7eb;
+    --border: #e2e4e8;
+    --ok: #16a34a;
+    --bad: #dc2626;
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --card: #181b21;
+      --text: #e8eaed;
+      --muted: #9aa1ab;
+      --accent: #3b82f6;
+      --bubble-them: #262a32;
+      --border: #262a32;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 16px;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; flex: 1; }
+  header h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 13px; color: var(--muted);
+    padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px;
+    background: var(--bg);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+  .dot.on { background: var(--ok); }
+
+  button {
+    font: inherit; border: 0; border-radius: 10px; cursor: pointer;
+    background: var(--accent); color: var(--accent-text);
+    padding: 8px 16px;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--accent);
+    border: 1px solid var(--border);
+  }
+
+  /* Hero / connect screen */
+  #hero {
+    flex: 1; display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 32px;
+    max-width: 460px; width: 100%; text-align: center;
+    box-shadow: 0 4px 24px rgba(0,0,0,.06);
+  }
+  .card h2 { margin: 0 0 6px; font-size: 22px; }
+  .card p  { color: var(--muted); margin: 0 0 20px; }
+  .card .big { font-size: 17px; padding: 12px 28px; }
+  .card .hint { font-size: 13px; margin-top: 18px; }
+  .card input {
+    font: inherit; width: 100%; padding: 10px 12px; margin-bottom: 14px;
+    border: 1px solid var(--border); border-radius: 10px;
+    background: var(--bg); color: var(--text); text-align: center;
+  }
+  .card input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  #unsupported { display: none; }
+
+  /* Chat screen */
+  #chat { flex: 1; display: none; flex-direction: column; min-height: 0; }
+  #log {
+    flex: 1; overflow-y: auto; padding: 16px;
+    display: flex; flex-direction: column; gap: 8px;
+    scroll-behavior: smooth;
+  }
+  @media (prefers-reduced-motion: reduce) { #log { scroll-behavior: auto; } }
+
+  .msg { max-width: 72%; display: flex; flex-direction: column; }
+  .msg .bubble {
+    padding: 8px 12px; border-radius: var(--radius);
+    white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+  }
+  .msg .meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .msg.me   { align-self: flex-end; align-items: flex-end; }
+  .msg.me .bubble   { background: var(--accent); color: var(--accent-text); border-bottom-right-radius: 4px; }
+  .msg.them { align-self: flex-start; align-items: flex-start; }
+  .msg.them .bubble { background: var(--bubble-them); border-bottom-left-radius: 4px; }
+  .msg.them .who { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 4px 2px; }
+
+  .sys {
+    align-self: center; font-size: 12px; color: var(--muted);
+    background: var(--card); border: 1px solid var(--border);
+    padding: 3px 12px; border-radius: 999px;
+  }
+
+  #composer {
+    flex: 0 0 auto; display: flex; gap: 8px; align-items: flex-end;
+    padding: 12px 16px; background: var(--card); border-top: 1px solid var(--border);
+  }
+  #composer .inputwrap { flex: 1; position: relative; }
+  #text {
+    font: inherit; width: 100%; padding: 10px 64px 10px 12px;
+    border: 1px solid var(--border); border-radius: 10px;
+    background: var(--bg); color: var(--text); resize: none;
+  }
+  #text:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  #count {
+    position: absolute; right: 10px; bottom: 10px;
+    font-size: 11px; color: var(--muted); pointer-events: none;
+  }
+  #count.over { color: var(--bad); }
+
+  #newmsgs {
+    position: fixed; bottom: 84px; left: 50%; transform: translateX(-50%);
+    display: none; font-size: 13px;
+    background: var(--accent); color: var(--accent-text);
+    padding: 6px 14px; border-radius: 999px; cursor: pointer;
+    box-shadow: 0 2px 12px rgba(0,0,0,.25);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>LoRa Chat <small id="subtitle">LightTracker · 923.2 MHz</small></h1>
+  <span class="pill" id="gpspill" title="Your LightTracker's GPS">GPS —</span>
+  <span class="pill"><span class="dot" id="dot"></span><span id="status">Disconnected</span></span>
+  <button class="ghost" id="reconnect" style="display:none">Reconnect</button>
+</header>
+
+<div id="hero">
+  <div class="card" id="connectCard">
+    <h2>Off-grid chat over LoRa radio</h2>
+    <p>Plug a LightTracker into USB, pick a name, and talk to anyone
+       in radio range — no internet, no server.</p>
+    <input id="nameInput" maxlength="16" placeholder="Your name" autocomplete="off">
+    <button class="big" id="connectBtn">Connect LightTracker</button>
+    <p class="hint">Your browser will ask which USB device to use —
+       choose <b>Arduino M0</b>.</p>
+  </div>
+  <div class="card" id="unsupported">
+    <h2>This browser can't talk to USB devices</h2>
+    <p>LoRa Chat needs the Web Serial API, available in
+       <b>Chrome</b>, <b>Edge</b> or <b>Opera</b> on a desktop or laptop.
+       Open this page in one of those browsers and you're set.</p>
+  </div>
+</div>
+
+<div id="chat">
+  <div id="log" aria-live="polite"></div>
+  <div id="composer">
+    <div class="inputwrap">
+      <textarea id="text" rows="1" maxlength="180" placeholder="Message…" disabled></textarea>
+      <span id="count">180</span>
+    </div>
+    <button id="send" disabled>Send</button>
+  </div>
+</div>
+
+<div id="newmsgs">New messages ↓</div>
+
+<script>
+"use strict";
+
+const MAX_TEXT = 180;
+const LIGHTTRACKER_VID = 0x2A03;
+
+const $ = id => document.getElementById(id);
+const els = {
+  hero: $("hero"), chat: $("chat"), log: $("log"),
+  connectCard: $("connectCard"), unsupported: $("unsupported"),
+  connectBtn: $("connectBtn"), nameInput: $("nameInput"),
+  dot: $("dot"), status: $("status"), reconnect: $("reconnect"),
+  text: $("text"), send: $("send"), count: $("count"),
+  newmsgs: $("newmsgs"), subtitle: $("subtitle"), gpspill: $("gpspill"),
+};
+
+let port = null, reader = null, writer = null;
+let connected = false;
+let myName = localStorage.getItem("lorachat.name") || "";
+let webMsgId = 0;
+let myPos = null;   // {lat,lon,alt} from our own board's GPS
+const bubblesById = new Map();   // webMsgId -> meta element for ✓ updates
+
+// ---------- Geo helpers ----------
+function haversineM(a, b) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
+  const s = Math.sin(dLat / 2) ** 2 +
+            Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+function bearingDeg(a, b) {
+  const r = Math.PI / 180;
+  const dLon = (b.lon - a.lon) * r;
+  const y = Math.sin(dLon) * Math.cos(b.lat * r);
+  const x = Math.cos(a.lat * r) * Math.sin(b.lat * r) -
+            Math.sin(a.lat * r) * Math.cos(b.lat * r) * Math.cos(dLon);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+const WINDS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+const ARROWS = ["↑","↗","→","↘","↓","↙","←","↖"];
+function fmtBearing(deg) {
+  return `${WINDS[Math.round(deg / 22.5) % 16]} ${ARROWS[Math.round(deg / 45) % 8]}`;
+}
+function fmtDistance(m) {
+  if (m < 1000) return `${Math.round(m)} m`;
+  return `${(m / 1000).toFixed(m < 10000 ? 2 : 1)} km`;
+}
+// Human line for a peer position relative to us; null if nothing to say
+function describePeerPos(pos) {
+  if (!pos) return null;
+  const parts = [];
+  if (pos.sats > 0) {
+    const peer = { lat: pos.lat, lon: pos.lon };
+    if (myPos) {
+      const dist = haversineM(myPos, peer);
+      const brg  = bearingDeg(myPos, peer);
+      parts.push(`📍 ${fmtDistance(dist)} ${fmtBearing(brg)}`);
+      if (pos.alt !== undefined && myPos.alt !== undefined) {
+        const dAlt = pos.alt - myPos.alt;
+        if (Math.abs(dAlt) >= 10) parts.push(`${dAlt > 0 ? "+" : ""}${dAlt} m alt`);
+      }
+    } else {
+      parts.push(`📍 ${pos.lat.toFixed(5)}, ${pos.lon.toFixed(5)}`);
+    }
+  }
+  if (pos.batt > 0.5) parts.push(`🔋 ${pos.batt} V`);
+  return parts.length ? parts.join("  ·  ") : null;
+}
+
+// ---------- UI helpers ----------
+function setStatus(on, label) {
+  connected = on;
+  els.dot.classList.toggle("on", on);
+  els.status.textContent = label;
+  els.text.disabled = !on;
+  els.send.disabled = !on;
+  els.reconnect.style.display = on ? "none" : "inline-block";
+}
+
+function nearBottom() {
+  return els.log.scrollHeight - els.log.scrollTop - els.log.clientHeight < 80;
+}
+function scrollLog(force) {
+  if (force || nearBottom()) {
+    els.log.scrollTop = els.log.scrollHeight;
+    els.newmsgs.style.display = "none";
+  } else {
+    els.newmsgs.style.display = "block";
+  }
+}
+els.newmsgs.addEventListener("click", () => scrollLog(true));
+els.log.addEventListener("scroll", () => { if (nearBottom()) els.newmsgs.style.display = "none"; });
+
+function timeNow() {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function addSystem(text) {
+  const el = document.createElement("div");
+  el.className = "sys";
+  el.textContent = text;
+  els.log.appendChild(el);
+  scrollLog(false);
+}
+
+function addMessage({ mine, from, text, rssi, snr, id, pos }) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + (mine ? "me" : "them");
+
+  if (!mine) {
+    const who = document.createElement("div");
+    who.className = "who";
+    who.textContent = from;
+    wrap.appendChild(who);
+  }
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = text;
+  wrap.appendChild(bubble);
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  let parts = [timeNow()];
+  if (!mine && rssi !== undefined) parts.push(`${rssi} dBm · SNR ${snr}`);
+  if (mine) parts.push("⏳");
+  meta.textContent = parts.join("  ·  ");
+  wrap.appendChild(meta);
+
+  if (!mine) {
+    const where = describePeerPos(pos);
+    if (where) {
+      const geo = document.createElement("div");
+      geo.className = "meta";
+      geo.textContent = where;
+      wrap.appendChild(geo);
+    }
+  }
+
+  els.log.appendChild(wrap);
+  if (mine && id !== undefined) bubblesById.set(id, { meta, time: timeNow() });
+  scrollLog(mine);
+}
+
+function setDelivery(id, mark) {
+  const b = bubblesById.get(id);
+  if (b) b.meta.textContent = `${b.time}  ·  ${mark}`;
+}
+
+// ---------- Serial plumbing ----------
+async function writeLine(obj) {
+  if (!writer) return;
+  try {
+    await writer.write(new TextEncoder().encode(JSON.stringify(obj) + "\n"));
+  } catch (e) { /* surfaced via read loop closing */ }
+}
+
+function handleBoardEvent(m) {
+  switch (m.t) {
+    case "ready":
+      if (!connected) {
+        setStatus(true, "Connected");
+        showChat();
+        writeLine({ t: "name", v: myName });
+        writeLine({ t: "join" });
+        addSystem(`You joined as ${myName} — announcing on ${m.freq} MHz`);
+      }
+      break;
+    case "rx":
+      addMessage({ mine: false, from: m.from, text: m.text, rssi: m.rssi, snr: m.snr, pos: m.pos });
+      break;
+    case "join": {
+      let line = `${m.from} joined the chat  (${m.rssi} dBm)`;
+      const where = describePeerPos(m.pos);
+      if (where) line += `  ·  ${where}`;
+      addSystem(line);
+      break;
+    }
+    case "gps":
+      if (m.fix) {
+        myPos = { lat: m.lat, lon: m.lon, alt: m.alt };
+        els.gpspill.textContent = `GPS ${m.sats} sats`;
+        els.gpspill.title = `Your position: ${m.lat.toFixed(5)}, ${m.lon.toFixed(5)} · ${m.alt} m · ${m.batt} V`;
+      } else {
+        myPos = null;
+        els.gpspill.textContent = "GPS no fix";
+        els.gpspill.title = `Searching for satellites… · battery ${m.batt} V`;
+      }
+      break;
+    case "sent": setDelivery(m.id, "✓ sent"); break;
+    case "ack":  setDelivery(m.id, "✓✓ delivered"); break;
+    case "err":  addSystem(`Board: ${m.msg}`); break;
+  }
+}
+
+async function readLoop() {
+  let buf = "";
+  const decoder = new TextDecoder();
+  try {
+    while (port && port.readable) {
+      reader = port.readable.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line) continue;
+            try { handleBoardEvent(JSON.parse(line)); } catch (_) { /* not ours */ }
+          }
+        }
+      } finally {
+        reader.releaseLock();
+        reader = null;
+      }
+    }
+  } catch (_) { /* device gone */ }
+  onDisconnected();
+}
+
+function onDisconnected() {
+  if (!port && !connected) return;
+  setStatus(false, "Disconnected");
+  if (els.chat.style.display !== "none" && els.hero.style.display === "none") {
+    addSystem("LightTracker disconnected — check the USB cable");
+  }
+  try { writer && writer.releaseLock(); } catch (_) {}
+  writer = null;
+  port = null;
+}
+
+async function openPort(p) {
+  await p.open({ baudRate: 115200 });
+  port = p;
+  writer = p.writable.getWriter();
+  readLoop();
+  setStatus(false, "Handshaking…");
+  // Fresh boards announce ready on boot; attached boards answer ping.
+  await writeLine({ t: "ping" });
+  setTimeout(() => { if (!connected) writeLine({ t: "ping" }); }, 1200);
+}
+
+async function connectFlow(interactive) {
+  myName = els.nameInput.value.trim().slice(0, 16) || myName || "anon";
+  localStorage.setItem("lorachat.name", myName);
+  try {
+    let p = null;
+    if (!interactive) {
+      const granted = await navigator.serial.getPorts();
+      p = granted.find(x => (x.getInfo().usbVendorId === LIGHTTRACKER_VID)) || null;
+      if (!p) return false;
+    } else {
+      p = await navigator.serial.requestPort({
+        filters: [{ usbVendorId: LIGHTTRACKER_VID }]
+      });
+    }
+    await openPort(p);
+    return true;
+  } catch (e) {
+    if (interactive && e.name !== "NotFoundError") {
+      setStatus(false, "Couldn't open port");
+    }
+    return false;
+  }
+}
+
+function showChat() {
+  els.hero.style.display = "none";
+  els.chat.style.display = "flex";
+  els.text.focus();
+}
+
+// ---------- Composer ----------
+function sendCurrent() {
+  const text = els.text.value.trim();
+  if (!text || !connected) return;
+  const id = ++webMsgId;
+  addMessage({ mine: true, text, id });
+  writeLine({ t: "tx", id, text });
+  els.text.value = "";
+  updateCount();
+}
+els.send.addEventListener("click", sendCurrent);
+els.text.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendCurrent(); }
+});
+function updateCount() {
+  const left = MAX_TEXT - els.text.value.length;
+  els.count.textContent = left;
+  els.count.classList.toggle("over", left <= 10);
+}
+els.text.addEventListener("input", updateCount);
+
+// ---------- Entry ----------
+els.connectBtn.addEventListener("click", () => connectFlow(true));
+els.nameInput.addEventListener("keydown", e => {
+  if (e.key === "Enter") connectFlow(true);
+});
+els.reconnect.addEventListener("click", async () => {
+  if (!(await connectFlow(false))) connectFlow(true);
+});
+
+if (!("serial" in navigator)) {
+  els.connectCard.style.display = "none";
+  els.unsupported.style.display = "block";
+} else {
+  navigator.serial.addEventListener("disconnect", onDisconnected);
+  els.nameInput.value = myName;
+  // One-click magic: if this browser already has permission for a
+  // LightTracker, reconnect automatically and announce ourselves.
+  connectFlow(false);
+}
+</script>
+</body>
+</html>

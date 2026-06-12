@@ -39,8 +39,9 @@ uint8_t navigationFrequencyGPS = 1; //1-10. Set the number of GPS nav solutions 
 //Following frequencies were chosen arbitrarily; and should be same on the reciever (RX) module.
 //If necessary, users can select the appropriate channels according to their country regulations.
 
-float loraFrequency = 865.2; //EU863-870
+//float loraFrequency = 865.2; //EU863-870
 //float loraFrequency = 907.4; //US902-928
+float loraFrequency = 923.2; //AS923 (Thailand 920-925 MHz)
 
 int8_t outputPower = 16; //dBm (max outputPower is 16 dBm for EU868, AS923, KR920, RU864)
 //int8_t outputPower = 22; //dBm (max outputPower is 30 dBm for US915, AU915, IN865 but device limit is 22 dBm)

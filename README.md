@@ -1,3 +1,73 @@
+# 💬 LoRa Chat — off-grid browser chat with two LightTrackers
+
+**Open the chat app:** **https://atominnovationth.github.io/TMX/**
+*(enable Pages once: repo Settings → Pages → branch `main`, folder `/docs`)*
+
+Chat with someone kilometers away with **no internet, no server, no installation**.
+Plug a LightTracker into USB, click the link, pick a name — the app finds the
+board, announces you to everyone in radio range, and you're chatting.
+
+- **One click** — runs entirely in the browser (Chrome / Edge / Opera on desktop)
+- **Verified link**: 923.2 MHz (AS923 Thailand), SF8 / BW125, ~1 s per message
+- **Delivery receipts**: ⏳ sending → ✓ sent over radio → ✓✓ delivered (radio ACK)
+- Live signal quality (RSSI / SNR) on every received message
+- **Direction finder**: every message carries the sender's GPS position — the app
+  shows live **distance and compass bearing** to the other person
+  (`📍 4.2 km NNE ↗`), altitude difference, and their battery voltage
+- Clean light/dark chat UI, join announcements, unplug/reconnect handling
+
+## <a name="chat-setup"></a>Chat quick start
+
+### 1. Flash both LightTrackers (one command each, prebuilt firmware included)
+
+```bash
+arduino-cli upload -b arduino:samd:mzero_bl -p /dev/cu.usbmodemXXXX \
+  --input-file build/chat/lora-chat.ino.hex
+```
+
+> macOS Apple Silicon note: the stock Arduino avrdude is a 32-bit i386 binary
+> that won't run. See [RECOVERY.md](RECOVERY.md) for the one-time x86_64 fix.
+> Never use Homebrew avrdude 8.x with this board.
+
+### 2. Enable GitHub Pages (once)
+
+Settings → Pages → Source: **Deploy from a branch** → Branch: **main**,
+folder: **/docs** → Save. The app then lives at
+`https://atominnovationth.github.io/TMX/`.
+
+### 3. Chat
+
+Each person: plug a LightTracker into a laptop → open the app link in Chrome
+or Edge → type a name → **Connect LightTracker** → pick *Arduino M0*. The app
+announces "you joined" over the air; messages flow both ways with delivery
+ticks. Range: km-scale line of sight with the stock antenna.
+
+### How it works
+
+```
+Browser ⇄ Web Serial (USB) ⇄ LightTracker ⇄ 923.2 MHz LoRa ⇄ LightTracker ⇄ Web Serial ⇄ Browser
+```
+
+- `lora-chat/lora-chat.ino` — transceiver firmware (same sketch on both boards):
+  NDJSON over USB serial; compact binary frames over the air with magic-byte
+  filtering, per-boot random sender IDs, duplicate suppression,
+  listen-before-talk (CAD + random backoff), and ACK + one retransmit.
+  Chat and join frames carry a 12-byte position trailer (GPS lat/lon/alt,
+  satellite count, battery); the header GPS pill shows your own fix status.
+- `docs/index.html` — the whole app in a single file. Vanilla JS, zero
+  dependencies, zero external requests, works offline once loaded.
+
+**Limits (by design):** text only, ≤180 chars/message, half-duplex (~2.5 kbps
+raw), 2+ participants share one channel, no encryption (don't send secrets).
+Check your local regulations for the 920–925 MHz ISM band; the firmware
+defaults comply with AS923 Thailand (16 dBm).
+
+**Restore the original tracker firmware anytime:** flash
+`build/tx/lora-asset-tracker-tx.ino.hex` or `build/rx/lora-asset-tracker-rx.ino.hex`
+with the same upload command.
+
+---
+
 **Retired Product:** This product has been retired from our catalog and is no longer for sale. Check out [LighTracker 1.1](https://github.com/lightaprs/LightTracker-1.1)
 
 # LightTracker

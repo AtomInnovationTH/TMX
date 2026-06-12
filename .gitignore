@@ -31,3 +31,11 @@
 *.out
 *.app
 .DS_Store
+
+# Local agent/session files
+.kilo/
+
+# Build intermediates (prebuilt .hex files ARE committed for easy flashing)
+build/**/*.elf
+build/**/*.map
+build/**/*.bin

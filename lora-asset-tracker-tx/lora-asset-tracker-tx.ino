@@ -25,7 +25,7 @@ LIS3DH myIMU; //Default constructor is I2C, addr 0x19.
 
 //#define DEVMODE // Development mode. Uncomment to enable for debugging.
 
-boolean airborne = false; //if you want to put the tracker on a airborne device, set this variable true;
+boolean airborne = true; //if you want to put the tracker on a airborne device, set this variable true;
 
 //*********** General Settings ***********// 
 uint16_t    trackerID = 1234; //change this and set a random unique trackerID to avoid conflicts if you have multiple trackers.
@@ -40,8 +40,9 @@ boolean loRaEnabled = true;
 
 //Following frequencies were chosen arbitrarily; and should be same on the reciever (RX) module.
 //If necessary, users can select the appropriate channels according to their country regulations.
-float loraFrequency = 865.2; //EU863-870
+//float loraFrequency = 865.2; //EU863-870
 //float loraFrequency = 907.4; //US902-928
+float loraFrequency = 923.2; //AS923 (Thailand 920-925 MHz)
 
 int8_t outputPower = 16; //dBm (max outputPower is 16 dBm for EU868, AS923, KR920, RU864)
 //int8_t outputPower = 22; //dBm (max outputPower is 30 dBm for US915, AU915, IN865 but device limit is 22 dBm)
