@@ -59,7 +59,7 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
   .dot.on { background: var(--ok); }
   .pill.lowbatt { color: var(--bad); border-color: var(--bad); }
-  #linkpill { display: none; letter-spacing: 1px; font-family: monospace; }
+  #linkpill { display: none; }
 
   button {
     font: inherit; border: 0; border-radius: 10px; cursor: pointer;
@@ -308,7 +308,8 @@ let port = null, reader = null, writer = null;
 let connected = false;
 let myName = localStorage.getItem("lorachat.name") || "";
 let webMsgId = 0;
-let myPos = null;   // {lat,lon,alt} from our own board's GPS
+let myPos = null;   // {lat,lon,alt} — last good fix; kept through brief dropouts
+let myPosTs = 0;    // when myPos was last refreshed by a live fix
 let myGps = null;   // full last "gps" event from the board (telemetry panel)
 const battHist = [];             // [{t, v}] own battery, ~10 min window
 const BATT_HIST_MS = 10 * 60000;
@@ -361,16 +362,42 @@ els.soundBtn.addEventListener("click", () => {
 });
 
 // ---------- Link quality (last received RSSI) ----------
-function rssiBars(rssi) {
+// Crisp 4-bar signal meter (inline SVG) — cleaner than block glyphs.
+function signalMeter(rssi) {
   const r = +rssi;
   const lvl = r > -70 ? 4 : r > -90 ? 3 : r > -105 ? 2 : 1;
-  return "▂▄▆█".slice(0, lvl);
+  const svg = svgEl("svg", { width: 18, height: 12, viewBox: "0 0 18 12",
+                             style: "display:block" });
+  for (let i = 0; i < 4; i++) {
+    const h = 3 + i * 3;
+    svg.appendChild(svgEl("rect", { x: i * 4.5, y: 12 - h, width: 3, height: h, rx: 0.5,
+      fill: i < lvl ? "var(--text)" : "var(--border)" }));
+  }
+  return svg;
 }
 function updateLink(rssi, snr) {
   if (rssi === undefined) return;
   els.linkpill.style.display = "inline-flex";
-  els.linkpill.textContent = rssiBars(rssi);
+  els.linkpill.replaceChildren(signalMeter(rssi));
   els.linkpill.title = `Last received signal: ${rssi} dBm · SNR ${snr} dB`;
+}
+
+// Header GPS pill: live fix, "lost · age" while holding a last fix, or no fix.
+function updateGpsPill() {
+  const m = myGps;
+  const low = m && m.batt > 0.5 && m.batt < LOW_BATT_V;
+  if (m && m.fix) {
+    els.gpspill.textContent = `GPS ${m.sats} sats`;
+    els.gpspill.title = `Your position: ${(+m.lat).toFixed(5)}, ${(+m.lon).toFixed(5)} · ${m.alt} m · ${m.batt} V`;
+  } else if (myPos) {
+    els.gpspill.textContent = `GPS lost · ${fmtAge(Date.now() - myPosTs)}`;
+    els.gpspill.title = `No current fix — showing last known position (${fmtAge(Date.now() - myPosTs)})`;
+  } else {
+    els.gpspill.textContent = "GPS no fix";
+    els.gpspill.title = m ? `Searching… · battery ${m.batt} V` : "Searching for satellites…";
+  }
+  if (low) { els.gpspill.textContent += " · 🔋⚠"; els.gpspill.title += ` · LOW BATTERY ${m.batt} V`; }
+  els.gpspill.classList.toggle("lowbatt", !!low);
 }
 
 // ---------- Geo helpers ----------
@@ -423,26 +450,18 @@ function describePeerPos(pos, { batt = true } = {}) {
 
 // ---------- Peers (roster + radar + telemetry) ----------
 // name -> {lat?, lon?, alt?, batt?, sats, rssi?, snr?, ts,
-//          trail:[{lat,lon}], sig:[rssi…], ext?:{speed,course,hacc,fixType}}
+//          trail:[{lat,lon}], ext?:{speed,course,hacc,fixType}}
 const peers = new Map();
 let focusedPeer = null;           // telemetry panel focus (click roster/radar)
 let radarOn = localStorage.getItem("lorachat.radar") !== "0";  // right column on/off
 const SVGNS = "http://www.w3.org/2000/svg";
 const PEER_TTL_MS = 15 * 60000;   // drop peers not heard from in 15 min
 const TRAIL_MAX = 20;             // breadcrumb points kept per peer
-const SIG_MAX = 20;               // RSSI sparkline points kept per peer
-const DIST_MAX = 12;              // distance samples kept per peer (range trend)
 
 function notePeer(from, pos, rssi, snr, ext) {
-  const p = peers.get(from) || { trail: [], sig: [] };
-  if (!p.sig) p.sig = [];
+  const p = peers.get(from) || { trail: [] };
   p.ts = Date.now();
-  if (rssi !== undefined) {
-    p.rssi = rssi;
-    p.snr = snr;
-    p.sig.push(+rssi);
-    if (p.sig.length > SIG_MAX) p.sig.shift();
-  }
+  if (rssi !== undefined) { p.rssi = rssi; p.snr = snr; }
   if (ext) p.ext = ext;
   if (pos) {
     p.batt = pos.batt;
@@ -453,11 +472,6 @@ function notePeer(from, pos, rssi, snr, ext) {
         if (p.trail.length > TRAIL_MAX) p.trail.shift();
       }
       p.lat = pos.lat; p.lon = pos.lon; p.alt = pos.alt;
-      if (myPos) {
-        if (!p.dist) p.dist = [];
-        p.dist.push({ t: p.ts, d: haversineM(myPos, { lat: p.lat, lon: p.lon }) });
-        if (p.dist.length > DIST_MAX) p.dist.shift();
-      }
     }
   }
   peers.set(from, p);
@@ -564,6 +578,7 @@ function drawRadar() {
     els.radarMsg.textContent = "Waiting for your GPS fix…";
     return;
   }
+  const fixLost = !(myGps && myGps.fix);   // holding last known position
 
   const plotted = [...peers.entries()]
     .filter(([, p]) => p.lat !== undefined)
@@ -576,8 +591,9 @@ function drawRadar() {
   svg.appendChild(svgEl("text", { x: C + 4, y: C - R / 2 - 3, style: label }, fmtDistance(scale / 2)));
   svg.appendChild(svgEl("text", { x: C + 4, y: C - R + 11, style: label }, fmtDistance(scale)));
 
-  // me, at the center — with a heading tick when moving
-  svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5, style: "fill:var(--accent)" }));
+  // me, at the center — dimmed when we're coasting on a lost fix
+  svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5,
+    style: "fill:var(--accent)" + (fixLost ? ";opacity:.4" : "") }));
   if (myGps && +myGps.speed > 2 && myGps.course !== undefined) {
     const ca = myGps.course * Math.PI / 180;
     svg.appendChild(svgEl("line", {
@@ -629,9 +645,11 @@ function drawRadar() {
     svg.appendChild(g);
   }
 
-  els.radarMsg.textContent = plotted.length
+  let radarMsg = plotted.length
     ? `North up · outer ring ${fmtDistance(scale)}`
     : "Peers appear here as their messages and beacons arrive";
+  if (fixLost) radarMsg = `GPS lost ${fmtAge(now - myPosTs)} · last known · ` + radarMsg;
+  els.radarMsg.textContent = radarMsg;
 }
 
 function applyRadarVisibility() {
@@ -655,33 +673,6 @@ function battTrendArrow() {
 function fmtUptime(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h ? `${h} h ${m} min` : m ? `${m} min` : `${s} s`;
-}
-
-// Range trend for a peer: are we closing on them or opening up? Derived from
-// the recent distance samples — the key question when you're tracking someone.
-function rangeTrend(p) {
-  if (!p.dist || p.dist.length < 2) return null;
-  const a = p.dist[0], b = p.dist[p.dist.length - 1];
-  const dt = (b.t - a.t) / 1000;
-  if (dt < 20) return null;
-  const ms = (b.d - a.d) / dt;          // + opening, − closing
-  if (Math.abs(ms) < 0.12) return { word: "holding range", cls: "" };
-  const kmh = (Math.abs(ms) * 3.6).toFixed(1);
-  return ms < 0
-    ? { word: `closing · ${kmh} km/h ↓`, cls: "good" }
-    : { word: `opening · ${kmh} km/h ↑`, cls: "warn" };
-}
-
-// Extrapolate time-to-low from the 10-min battery history slope.
-function battRuntime() {
-  if (battHist.length < 2) return null;
-  const a = battHist[0], b = battHist[battHist.length - 1];
-  const dt = (b.t - a.t) / 1000;
-  if (dt < 180) return null;            // need a few minutes of trend
-  const slope = (b.v - a.v) / dt;       // V/s
-  if (slope >= -2e-6) return null;      // flat or charging
-  const secs = (b.v - LOW_BATT_V) / -slope;
-  return secs > 0 && secs < 86400 ? secs : null;  // hide nonsense > 24 h
 }
 
 // Link quality word from SNR — turns a raw dB number into a glanceable margin.
@@ -733,22 +724,6 @@ function tempty(parent, text) {
   parent.appendChild(e);
 }
 
-// 20-point RSSI sparkline — same inline-SVG pattern as the radar
-function sparkline(values) {
-  const W = 110, H = 22, LO = -130, HI = -30;
-  const svg = svgEl("svg", { width: W, height: H, style: "vertical-align:middle" });
-  const pts = values.map((v, i) => {
-    const x = values.length > 1 ? i / (values.length - 1) * (W - 2) + 1 : W / 2;
-    const y = H - 1 - (Math.min(Math.max(+v, LO), HI) - LO) / (HI - LO) * (H - 2);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-  svg.appendChild(svgEl("polyline", {
-    points: pts,
-    style: "fill:none;stroke:var(--accent);stroke-width:1.5",
-  }));
-  return svg;
-}
-
 function renderTelemetry() {
   if (!radarOn) return;
 
@@ -759,45 +734,47 @@ function renderTelemetry() {
   if (!m) {
     tempty(mine, "Waiting for board data…");
   } else {
-    // Headline: is my fix good? That's the first thing you check.
+    const fixLost = !m.fix;
+    // Headline: fix state is what you check first.
     if (m.fix) {
       theadline(mine, `${FIX_NAMES[m.fixType] ?? "fix"} · ${m.sats} sats`,
                 m.hacc !== undefined ? `±${m.hacc} m` : "", "good");
+    } else if (myPos) {
+      theadline(mine, "GPS fix lost", `last fix ${fmtAge(Date.now() - myPosTs)}`, "warn");
     } else {
       theadline(mine, "No GPS fix",
                 m.sats !== undefined ? `${m.sats} sats in view` : "searching…", "bad");
     }
-    if (m.fix) {
-      const coords = `${(+m.lat).toFixed(7)},${(+m.lon).toFixed(7)}`;
+    // Position: live fix, else the last known one (kept through dropouts).
+    const showPos = m.fix ? { lat: +m.lat, lon: +m.lon, alt: m.alt } : myPos;
+    if (showPos) {
+      const coords = `${showPos.lat.toFixed(7)},${showPos.lon.toFixed(7)}`;
       const v = trow(mine, "Position",
-                     `${(+m.lat).toFixed(5)}, ${(+m.lon).toFixed(5)} · ${m.alt} m`,
+                     `${showPos.lat.toFixed(5)}, ${showPos.lon.toFixed(5)} · ${showPos.alt} m`
+                       + (fixLost ? " · last known" : ""),
                      "Click to copy coordinates");
       v.classList.add("click");
+      if (fixLost) v.classList.add("warn");
       v.addEventListener("click", () => {
         navigator.clipboard && navigator.clipboard.writeText(coords);
       });
-      if (m.speed !== undefined) {
-        trow(mine, "Speed", +m.speed > 2
-          ? `${m.speed} km/h ${fmtBearing(m.course)}`
-          : `${m.speed} km/h`);
-      }
-      if (m.pdop !== undefined) {
-        trow(mine, "Geometry", `pDOP ${m.pdop}`,
-             "Lower pDOP = better satellite geometry");
-      }
+    }
+    if (m.fix && m.speed !== undefined) {
+      trow(mine, "Speed", +m.speed > 2
+        ? `${m.speed} km/h ${fmtBearing(m.course)}`
+        : `${m.speed} km/h`);
+    }
+    if (m.fix && m.pdop !== undefined) {
+      trow(mine, "Geometry", `pDOP ${m.pdop}`,
+           "Lower pDOP = better satellite geometry");
     }
     if (m.utc) trow(mine, "UTC", m.utc.replace("T", " ").replace("Z", ""),
                     "Satellite-synced clock from the board");
     if (m.batt > 0.5) {
       const low = m.batt < LOW_BATT_V;
-      const secs = battRuntime();
-      let txt = `${m.batt} V${battTrendArrow()}`;
-      if (secs) txt += ` · ~${fmtUptime(Math.round(secs))} to low`;
-      else if (low) txt += " · low";
-      const v = trow(mine, "Battery", txt,
-           "Trend arrow + runtime estimated from the last 10 min");
+      const v = trow(mine, "Battery", `${m.batt} V${battTrendArrow()}${low ? " · low" : ""}`,
+           "Trend arrow: charging/draining over the last 10 min");
       if (low) v.classList.add("bad");
-      else if (secs) v.classList.add("warn");
     }
     if (m.up !== undefined) trow(mine, "Uptime", fmtUptime(m.up));
     if (m.tx !== undefined) trow(mine, "Packets", `${m.tx} tx · ${m.rx} rx`);
@@ -827,11 +804,6 @@ function renderTelemetry() {
   if (p.lat !== undefined && myPos) {
     theadline(pp, `${fmtDistance(haversineM(myPos, p))} ${fmtBearing(bearingDeg(myPos, p))}`,
               fmtAge(now - p.ts), stale ? "warn" : "");
-    const tr = rangeTrend(p);
-    if (tr) {
-      const v = trow(pp, "Range trend", tr.word);
-      if (tr.cls) v.classList.add(tr.cls);
-    }
   } else if (p.lat !== undefined) {
     theadline(pp, `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`,
               "no local fix to compare", "");
@@ -859,9 +831,6 @@ function renderTelemetry() {
     const v = trow(pp, "Signal",
          `${p.rssi} dBm · SNR ${p.snr} dB${sw ? " · " + sw.word : ""}`);
     if (sw && sw.cls) v.classList.add(sw.cls);
-    if (p.sig && p.sig.length >= 2) {
-      trow(pp, "History", sparkline(p.sig), "Signal strength, last 20 packets");
-    }
   }
   if (p.trail.length) trow(pp, "Trail", `${p.trail.length + 1} points`);
 }
@@ -999,13 +968,6 @@ function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore })
   const meta = document.createElement("div");
   meta.className = "meta";
   meta.textContent = when;
-  if (!mine && rssi !== undefined) {
-    // Compact strength glyph only — exact dBm/SNR live in the telemetry panel.
-    const sig = document.createElement("span");
-    sig.textContent = "  ·  " + rssiBars(rssi);
-    sig.title = `Signal when received: ${rssi} dBm · SNR ${snr} dB`;
-    meta.appendChild(sig);
-  }
   if (mine && !restore) { meta.textContent = `${when}  ·  ⏳`; meta.title = DELIVERY_TIPS["⏳"]; }
   wrap.appendChild(meta);
 
@@ -1113,22 +1075,9 @@ function handleBoardEvent(m) {
         battHist.push({ t: Date.now(), v: +m.batt });
         while (battHist.length && Date.now() - battHist[0].t > BATT_HIST_MS) battHist.shift();
       }
-      if (m.fix) {
-        myPos = { lat: m.lat, lon: m.lon, alt: m.alt };
-        els.gpspill.textContent = `GPS ${m.sats} sats`;
-        els.gpspill.title = `Your position: ${m.lat.toFixed(5)}, ${m.lon.toFixed(5)} · ${m.alt} m · ${m.batt} V`;
-      } else {
-        myPos = null;
-        els.gpspill.textContent = "GPS no fix";
-        els.gpspill.title = `Searching for satellites… · battery ${m.batt} V`;
-      }
-      if (m.batt > 0.5 && m.batt < LOW_BATT_V) {
-        els.gpspill.classList.add("lowbatt");
-        els.gpspill.textContent += " · 🔋⚠";
-        els.gpspill.title += ` · LOW BATTERY ${m.batt} V`;
-      } else {
-        els.gpspill.classList.remove("lowbatt");
-      }
+      // Keep the last good fix through brief dropouts instead of blanking.
+      if (m.fix) { myPos = { lat: m.lat, lon: m.lon, alt: m.alt }; myPosTs = Date.now(); }
+      updateGpsPill();
       if (radarOn) drawRadar();
       drawRoster();   // distances depend on our own position
       renderTelemetry();
@@ -1221,6 +1170,7 @@ function showChat() {
   applySoundBtn();
   renderHistory();
   applyRadarVisibility();
+  scrollLog(true);   // always land on the latest message
   els.text.focus();
 }
 
@@ -1261,6 +1211,7 @@ els.radarBtn.addEventListener("click", () => {
 });
 setInterval(() => {
   if (!connected) return;
+  updateGpsPill();   // keep the "GPS lost · age" counter fresh
   if (radarOn) drawRadar();
   drawRoster();
   renderTelemetry();
