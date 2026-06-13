@@ -97,9 +97,15 @@
   /* Chat screen — two-column desktop layout */
   #chat {
     flex: 1; display: none; min-height: 0;
-    grid-template-columns: minmax(0, 1fr) 360px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
   #left { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  #leftbar {
+    flex: 0 0 auto; display: flex; align-items: center;
+    padding: 8px 16px; border-bottom: 1px solid var(--border);
+  }
+  #leftbarTitle { font-size: 12px; color: var(--muted); font-weight: 600; }
+  #resetBtn { margin-left: auto; padding: 4px 12px; font-size: 13px; }
   #right {
     display: flex; flex-direction: column; gap: 12px;
     padding: 12px 12px 12px 0; overflow-y: auto; min-height: 0;
@@ -153,14 +159,6 @@
   }
   #count.over { color: var(--bad); }
 
-  #newmsgs {
-    position: fixed; bottom: 84px; left: 50%; transform: translateX(-50%);
-    display: none; font-size: 13px;
-    background: var(--accent); color: var(--accent-text);
-    padding: 6px 14px; border-radius: 999px; cursor: pointer;
-    box-shadow: 0 2px 12px rgba(0,0,0,.25);
-  }
-
   /* Peer roster */
   #roster {
     display: none; gap: 8px; overflow-x: auto;
@@ -199,20 +197,23 @@
   .trow .tl { color: var(--muted); flex: 0 0 auto; }
   .trow .tv { text-align: right; overflow-wrap: anywhere; min-width: 0; }
   .tv.click { cursor: pointer; }
-  .tempty { color: var(--muted); font-size: 13px; padding: 2px 0; }
 
-  /* Telemetry headline: the one fact you check first, given visual weight */
+  /* Telemetry headline: a friendly summary line with a CONSTANT style. State is
+     conveyed by the small status dot, not by recoloring/resizing this line. */
   .theadline {
-    font-size: 17px; font-weight: 600; line-height: 1.25; margin: 2px 0 8px;
+    display: flex; align-items: baseline; gap: 8px;
+    font-size: 16px; font-weight: 600; line-height: 1.25;
+    color: var(--text); margin: 2px 0 8px;
   }
   .theadline .sub { font-size: 12px; font-weight: 400; color: var(--muted); }
-  .theadline.good { color: var(--ok); }
-  .theadline.bad  { color: var(--bad); }
-  .theadline.warn { color: #d97706; }
-  /* Value highlighting for prioritized rows */
-  .tv.good { color: var(--ok); }
-  .tv.bad  { color: var(--bad); }
-  .tv.warn { color: #d97706; }
+  /* Small, fixed-size status indicator — only its color changes between renders */
+  .tdot {
+    width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+    align-self: center; background: var(--muted);
+  }
+  .tdot.good { background: var(--ok); }
+  .tdot.warn { background: #d97706; }
+  .tdot.bad  { background: var(--bad); }
 
   @media (max-width: 900px) {
     /* Fallback: right column stacks above the chat, like the v1.2 layout */
@@ -256,6 +257,10 @@
 
 <div id="chat">
   <div id="left">
+    <div id="leftbar">
+      <span id="leftbarTitle">Messages</span>
+      <button class="ghost" id="resetBtn" title="Clear chat history">Reset</button>
+    </div>
     <div id="roster"></div>
     <div id="log" aria-live="polite"></div>
     <div id="composer">
@@ -280,8 +285,6 @@
   </div>
 </div>
 
-<div id="newmsgs">New messages ↓</div>
-
 <script>
 "use strict";
 
@@ -296,10 +299,11 @@ const els = {
   connectBtn: $("connectBtn"), nameInput: $("nameInput"),
   dot: $("dot"), status: $("status"), reconnect: $("reconnect"),
   text: $("text"), send: $("send"), count: $("count"),
-  newmsgs: $("newmsgs"), subtitle: $("subtitle"), gpspill: $("gpspill"),
+  subtitle: $("subtitle"), gpspill: $("gpspill"),
   radarBtn: $("radarBtn"), right: $("right"),
   radarSvg: $("radarSvg"), radarMsg: $("radarMsg"),
   roster: $("roster"), linkpill: $("linkpill"), soundBtn: $("soundBtn"),
+  resetBtn: $("resetBtn"),
   telemMine: $("telemMine"), telemPeer: $("telemPeer"),
   telemPeerName: $("telemPeerName"),
 };
@@ -646,7 +650,7 @@ function drawRadar() {
   }
 
   let radarMsg = plotted.length
-    ? `North up · outer ring ${fmtDistance(scale)}`
+    ? `Outer ring ${fmtDistance(scale)}`
     : "Peers appear here as their messages and beacons arrive";
   if (fixLost) radarMsg = `GPS lost ${fmtAge(now - myPosTs)} · last known · ` + radarMsg;
   els.radarMsg.textContent = radarMsg;
@@ -685,154 +689,173 @@ function signalWord(snr) {
                  : { word: "weak",   cls: "bad" };
 }
 
-// Prominent headline line at the top of a telemetry panel.
-function theadline(parent, main, sub, cls) {
-  const h = document.createElement("div");
-  h.className = "theadline" + (cls ? " " + cls : "");
-  h.textContent = main;
-  if (sub) {
-    const s = document.createElement("span");
-    s.className = "sub";
-    s.textContent = "  " + sub;
-    h.appendChild(s);
-  }
-  parent.appendChild(h);
-  return h;
-}
+// ---- Stable skeleton: built once, then only values/dot color change ----
+let telemBuilt = false;
+const telemEls = {};
+let mineCoords = null;   // current "my board" coords for click-to-copy
+const DASH = "—";
 
-// label/value row; returns the value element for extra wiring
-function trow(parent, label, value, title) {
+function thRow(parent, label, title) {
   const row = document.createElement("div");
   row.className = "trow";
-  const l = document.createElement("span");
-  l.className = "tl";
-  l.textContent = label;
-  const v = document.createElement("span");
-  v.className = "tv";
-  if (value instanceof Node) v.appendChild(value);
-  else v.textContent = value;
   if (title) row.title = title;
+  const l = document.createElement("span");
+  l.className = "tl"; l.textContent = label;
+  const v = document.createElement("span");
+  v.className = "tv"; v.textContent = DASH;
   row.append(l, v);
   parent.appendChild(row);
   return v;
 }
 
-function tempty(parent, text) {
-  const e = document.createElement("div");
-  e.className = "tempty";
-  e.textContent = text;
-  parent.appendChild(e);
+function thHead(parent) {
+  const h = document.createElement("div");
+  h.className = "theadline";
+  const dot = document.createElement("span"); dot.className = "tdot";
+  const main = document.createElement("span"); main.className = "thmain";
+  const sub = document.createElement("span"); sub.className = "sub";
+  h.append(dot, main, sub);
+  parent.appendChild(h);
+  return { dot, main, sub };
+}
+
+function setHead(parts, cls, mainText, subText) {
+  parts.dot.className = "tdot" + (cls ? " " + cls : "");
+  parts.main.textContent = mainText;
+  parts.sub.textContent = subText || "";
+}
+
+function buildTelemSkeleton() {
+  if (telemBuilt) return;
+  telemBuilt = true;
+
+  const mine = els.telemMine;
+  mine.replaceChildren();
+  telemEls.mineHead = thHead(mine);
+  telemEls.minePos = thRow(mine, "Position", "Click to copy coordinates");
+  telemEls.minePos.addEventListener("click", () => {
+    if (mineCoords && navigator.clipboard) navigator.clipboard.writeText(mineCoords);
+  });
+  telemEls.mineSpeed = thRow(mine, "Speed");
+  telemEls.mineGeom  = thRow(mine, "Geometry", "Lower pDOP = better satellite geometry");
+  telemEls.mineUtc   = thRow(mine, "UTC", "Satellite-synced clock from the board");
+  telemEls.mineBatt  = thRow(mine, "Battery", "Trend arrow: charging/draining over the last 10 min");
+  telemEls.mineUp    = thRow(mine, "Uptime");
+  telemEls.minePkts  = thRow(mine, "Packets");
+  telemEls.mineChan  = thRow(mine, "Channel", "Noise floor while idle — lower is a quieter channel");
+
+  const pp = els.telemPeer;
+  pp.replaceChildren();
+  telemEls.peerHead = thHead(pp);
+  telemEls.peerMoving = thRow(pp, "Moving");
+  telemEls.peerFix    = thRow(pp, "Their fix");
+  telemEls.peerAlt    = thRow(pp, "Alt delta");
+  telemEls.peerBatt   = thRow(pp, "Battery");
+  telemEls.peerSignal = thRow(pp, "Signal");
+  telemEls.peerTrail  = thRow(pp, "Trail");
 }
 
 function renderTelemetry() {
   if (!radarOn) return;
+  buildTelemSkeleton();
+  const now = Date.now();
 
-  // --- my board ---
-  const mine = els.telemMine;
-  mine.replaceChildren();
+  // --- my board: same rows every time; missing data shows "—" ---
   const m = myGps;
+  const fixLost = !(m && m.fix);
   if (!m) {
-    tempty(mine, "Waiting for board data…");
+    setHead(telemEls.mineHead, "", "Waiting for board…", "");
+  } else if (m.fix) {
+    setHead(telemEls.mineHead, "good", `${FIX_NAMES[m.fixType] ?? "fix"} · ${m.sats} sats`,
+            m.hacc !== undefined ? `±${m.hacc} m` : "");
+  } else if (myPos) {
+    setHead(telemEls.mineHead, "warn", "GPS fix lost", `last fix ${fmtAge(now - myPosTs)}`);
   } else {
-    const fixLost = !m.fix;
-    // Headline: fix state is what you check first.
-    if (m.fix) {
-      theadline(mine, `${FIX_NAMES[m.fixType] ?? "fix"} · ${m.sats} sats`,
-                m.hacc !== undefined ? `±${m.hacc} m` : "", "good");
-    } else if (myPos) {
-      theadline(mine, "GPS fix lost", `last fix ${fmtAge(Date.now() - myPosTs)}`, "warn");
-    } else {
-      theadline(mine, "No GPS fix",
-                m.sats !== undefined ? `${m.sats} sats in view` : "searching…", "bad");
-    }
-    // Position: live fix, else the last known one (kept through dropouts).
-    const showPos = m.fix ? { lat: +m.lat, lon: +m.lon, alt: m.alt } : myPos;
-    if (showPos) {
-      const coords = `${showPos.lat.toFixed(7)},${showPos.lon.toFixed(7)}`;
-      const v = trow(mine, "Position",
-                     `${showPos.lat.toFixed(5)}, ${showPos.lon.toFixed(5)} · ${showPos.alt} m`
-                       + (fixLost ? " · last known" : ""),
-                     "Click to copy coordinates");
-      v.classList.add("click");
-      if (fixLost) v.classList.add("warn");
-      v.addEventListener("click", () => {
-        navigator.clipboard && navigator.clipboard.writeText(coords);
-      });
-    }
-    if (m.fix && m.speed !== undefined) {
-      trow(mine, "Speed", +m.speed > 2
-        ? `${m.speed} km/h ${fmtBearing(m.course)}`
-        : `${m.speed} km/h`);
-    }
-    if (m.fix && m.pdop !== undefined) {
-      trow(mine, "Geometry", `pDOP ${m.pdop}`,
-           "Lower pDOP = better satellite geometry");
-    }
-    if (m.utc) trow(mine, "UTC", m.utc.replace("T", " ").replace("Z", ""),
-                    "Satellite-synced clock from the board");
-    if (m.batt > 0.5) {
-      const low = m.batt < LOW_BATT_V;
-      const v = trow(mine, "Battery", `${m.batt} V${battTrendArrow()}${low ? " · low" : ""}`,
-           "Trend arrow: charging/draining over the last 10 min");
-      if (low) v.classList.add("bad");
-    }
-    if (m.up !== undefined) trow(mine, "Uptime", fmtUptime(m.up));
-    if (m.tx !== undefined) trow(mine, "Packets", `${m.tx} tx · ${m.rx} rx`);
-    if (m.noise !== undefined) {
-      const n = +m.noise;
-      const v = trow(mine, "Channel",
-           `${m.noise} dBm · ${n < -100 ? "quiet" : n < -85 ? "some traffic" : "busy"}`,
-           "Noise floor while idle — lower is a quieter channel");
-      if (n >= -85) v.classList.add("warn");
-    }
+    setHead(telemEls.mineHead, "bad", "No GPS fix",
+            m.sats !== undefined ? `${m.sats} sats in view` : "searching…");
   }
 
-  // --- focused peer ---
+  const showPos = m && m.fix ? { lat: +m.lat, lon: +m.lon, alt: m.alt } : myPos;
+  if (showPos) {
+    mineCoords = `${showPos.lat.toFixed(7)},${showPos.lon.toFixed(7)}`;
+    telemEls.minePos.textContent =
+      `${showPos.lat.toFixed(5)}, ${showPos.lon.toFixed(5)} · ${showPos.alt} m`
+      + (fixLost ? " · last known" : "");
+    telemEls.minePos.classList.add("click");
+  } else {
+    mineCoords = null;
+    telemEls.minePos.textContent = DASH;
+    telemEls.minePos.classList.remove("click");
+  }
+
+  telemEls.mineSpeed.textContent =
+    m && m.fix && m.speed !== undefined
+      ? `${m.speed} km/h` + (+m.speed > 2 ? ` ${fmtBearing(m.course)}` : "")
+      : DASH;
+  telemEls.mineGeom.textContent =
+    m && m.fix && m.pdop !== undefined ? `pDOP ${m.pdop}` : DASH;
+  telemEls.mineUtc.textContent =
+    m && m.utc ? m.utc.replace("T", " ").replace("Z", "") : DASH;
+  telemEls.mineBatt.textContent =
+    m && m.batt > 0.5
+      ? `${m.batt} V${battTrendArrow()}${m.batt < LOW_BATT_V ? " · low" : ""}`
+      : DASH;
+  telemEls.mineUp.textContent = m && m.up !== undefined ? fmtUptime(m.up) : DASH;
+  telemEls.minePkts.textContent = m && m.tx !== undefined ? `${m.tx} tx · ${m.rx} rx` : DASH;
+  if (m && m.noise !== undefined) {
+    const n = +m.noise;
+    telemEls.mineChan.textContent =
+      `${m.noise} dBm · ${n < -100 ? "quiet" : n < -85 ? "some traffic" : "busy"}`;
+  } else {
+    telemEls.mineChan.textContent = DASH;
+  }
+
+  // --- focused peer: same rows every time ---
   const name = focusedTarget();
   els.telemPeerName.textContent = name ? `Peer · ${name}` : "Peer";
-  const pp = els.telemPeer;
-  pp.replaceChildren();
+
   if (!name) {
-    tempty(pp, "No peers heard yet");
+    setHead(telemEls.peerHead, "", "No peers heard yet", "");
+    for (const k of ["peerMoving","peerFix","peerAlt","peerBatt","peerSignal","peerTrail"])
+      telemEls[k].textContent = DASH;
     return;
   }
   const p = peers.get(name);
-  const now = Date.now();
   const stale = now - p.ts > 120000;
 
-  // Headline: where they are relative to us is the whole point of the panel.
   if (p.lat !== undefined && myPos) {
-    theadline(pp, `${fmtDistance(haversineM(myPos, p))} ${fmtBearing(bearingDeg(myPos, p))}`,
-              fmtAge(now - p.ts), stale ? "warn" : "");
+    setHead(telemEls.peerHead, stale ? "warn" : "good",
+            `${fmtDistance(haversineM(myPos, p))} ${fmtBearing(bearingDeg(myPos, p))}`,
+            fmtAge(now - p.ts));
   } else if (p.lat !== undefined) {
-    theadline(pp, `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`,
-              "no local fix to compare", "");
+    setHead(telemEls.peerHead, "", `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`,
+            "no local fix to compare");
   } else {
-    theadline(pp, "No position yet", fmtAge(now - p.ts), "warn");
+    setHead(telemEls.peerHead, "warn", "No position yet", fmtAge(now - p.ts));
   }
 
-  if (p.ext) {
-    trow(pp, "Moving", p.ext.speed > 2
-      ? `${fmtBearing(p.ext.course)} at ${p.ext.speed} km/h`
-      : "stationary");
-    trow(pp, "Their fix",
-         `${FIX_NAMES[p.ext.fixType] ?? p.ext.fixType} · ±${p.ext.hacc} m`);
-  }
-  if (p.alt !== undefined && myPos && myPos.alt !== undefined) {
+  telemEls.peerMoving.textContent = p.ext
+    ? (p.ext.speed > 2 ? `${fmtBearing(p.ext.course)} at ${p.ext.speed} km/h` : "stationary")
+    : DASH;
+  telemEls.peerFix.textContent = p.ext
+    ? `${FIX_NAMES[p.ext.fixType] ?? p.ext.fixType} · ±${p.ext.hacc} m`
+    : DASH;
+  if (p.alt !== undefined && myPos && myPos.alt !== undefined && Math.abs(p.alt - myPos.alt) >= 10) {
     const dAlt = p.alt - myPos.alt;
-    if (Math.abs(dAlt) >= 10) trow(pp, "Alt delta", `${dAlt > 0 ? "+" : ""}${dAlt} m`);
+    telemEls.peerAlt.textContent = `${dAlt > 0 ? "+" : ""}${dAlt} m`;
+  } else {
+    telemEls.peerAlt.textContent = DASH;
   }
-  if (p.batt > 0.5) {
-    const v = trow(pp, "Battery", `${p.batt} V${p.batt < LOW_BATT_V ? " · low" : ""}`);
-    if (p.batt < LOW_BATT_V) v.classList.add("bad");
-  }
+  telemEls.peerBatt.textContent =
+    p.batt > 0.5 ? `${p.batt} V${p.batt < LOW_BATT_V ? " · low" : ""}` : DASH;
   if (p.rssi !== undefined) {
     const sw = signalWord(p.snr);
-    const v = trow(pp, "Signal",
-         `${p.rssi} dBm · SNR ${p.snr} dB${sw ? " · " + sw.word : ""}`);
-    if (sw && sw.cls) v.classList.add(sw.cls);
+    telemEls.peerSignal.textContent =
+      `${p.rssi} dBm · SNR ${p.snr} dB${sw ? " · " + sw.word : ""}`;
+  } else {
+    telemEls.peerSignal.textContent = DASH;
   }
-  if (p.trail.length) trow(pp, "Trail", `${p.trail.length + 1} points`);
+  telemEls.peerTrail.textContent = p.trail.length ? `${p.trail.length + 1} points` : DASH;
 }
 
 // ---------- UI helpers ----------
@@ -845,19 +868,9 @@ function setStatus(on, label) {
   els.reconnect.style.display = on ? "none" : "inline-block";
 }
 
-function nearBottom() {
-  return els.log.scrollHeight - els.log.scrollTop - els.log.clientHeight < 80;
+function scrollLog() {
+  els.log.scrollTop = els.log.scrollHeight;
 }
-function scrollLog(force) {
-  if (force || nearBottom()) {
-    els.log.scrollTop = els.log.scrollHeight;
-    els.newmsgs.style.display = "none";
-  } else {
-    els.newmsgs.style.display = "block";
-  }
-}
-els.newmsgs.addEventListener("click", () => scrollLog(true));
-els.log.addEventListener("scroll", () => { if (nearBottom()) els.newmsgs.style.display = "none"; });
 
 function timeNow() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -883,6 +896,23 @@ function saveHistory(entry) {
   if (chatHistory.length > HISTORY_MAX) chatHistory = chatHistory.slice(-HISTORY_MAX);
   try { localStorage.setItem(HISTORY_KEY, JSON.stringify(chatHistory)); } catch (_) {}
 }
+
+// Wipe the chat log + saved history only. Connection, peers, radar and
+// telemetry are left untouched.
+function clearChat() {
+  chatHistory = [];
+  try { localStorage.removeItem(HISTORY_KEY); } catch (_) {}
+  els.log.replaceChildren();
+  lastMsgEpoch = 0;
+  bubblesById.clear();
+  for (const t of ackTimers.values()) clearTimeout(t);
+  ackTimers.clear();
+  historyRendered = true;   // nothing left to re-render
+  addSystem("Chat history cleared");
+}
+els.resetBtn.addEventListener("click", () => {
+  if (confirm("Clear chat history?")) clearChat();
+});
 
 function renderHistory() {
   if (historyRendered) return;
