@@ -13,7 +13,11 @@
     --muted: #6b7280;
     --accent: #2563eb;
     --accent-text: #ffffff;
-    --bubble-them: #e5e7eb;
+    --bubble-them: #ffffff;
+    --bubble-me: #06C755;
+    --bubble-me-text: #ffffff;
+    --chat-bg: #e9edf2;
+    --daypill-bg: rgba(0,0,0,.06);
     --border: #e2e4e8;
     --ok: #16a34a;
     --bad: #dc2626;
@@ -27,6 +31,10 @@
       --muted: #9aa1ab;
       --accent: #3b82f6;
       --bubble-them: #262a32;
+      --bubble-me: #06C755;
+      --bubble-me-text: #ffffff;
+      --chat-bg: #0b0d11;
+      --daypill-bg: rgba(255,255,255,.08);
       --border: #262a32;
     }
   }
@@ -112,7 +120,8 @@
   }
   #log {
     flex: 1; overflow-y: auto; padding: 16px;
-    display: flex; flex-direction: column; gap: 8px;
+    display: flex; flex-direction: column;
+    background: var(--chat-bg);
     scroll-behavior: smooth;
   }
   /* Anchor the conversation to the bottom (rises from the composer) until it
@@ -120,21 +129,61 @@
   #log > :first-child { margin-top: auto; }
   @media (prefers-reduced-motion: reduce) { #log { scroll-behavior: auto; } }
 
-  .msg { max-width: 72%; display: flex; flex-direction: column; }
-  .msg .bubble {
+  .msg { max-width: 82%; display: flex; gap: 8px; align-items: flex-end; }
+  .msg + .msg { margin-top: 10px; }
+  .msg.grouped { margin-top: 2px; }
+  .msg.them { align-self: flex-start; }
+  .msg.me   { align-self: flex-end; }
+
+  .avatar {
+    width: 32px; height: 32px; border-radius: 50%; flex: 0 0 auto;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 14px; font-weight: 600; user-select: none;
+  }
+  .msg.grouped .avatar { visibility: hidden; }
+
+  .content { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+  .msg.them .who {
+    font-size: 12px; font-weight: 600; color: var(--muted);
+    margin: 0 0 1px 4px; cursor: pointer;
+  }
+
+  .line { display: flex; align-items: flex-end; gap: 6px; }
+  .msg.me .line { justify-content: flex-end; }
+
+  .bubble {
     padding: 8px 12px; border-radius: var(--radius);
     white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
   }
-  .msg .meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
-  .msg .meta.retry { color: var(--bad); cursor: pointer; text-decoration: underline; }
-  .msg .meta a { color: inherit; }
-  .msg .meta .copybtn { cursor: pointer; margin-left: 6px; }
+  .msg.me .bubble {
+    background: var(--bubble-me); color: var(--bubble-me-text);
+    border-bottom-right-radius: 4px;
+  }
+  .msg.them .bubble {
+    background: var(--bubble-them); border: 1px solid var(--border);
+    border-bottom-left-radius: 4px;
+  }
+  /* Tail only on the first bubble of a turn; grouped bubbles stay fully rounded */
+  .msg.grouped.me   .bubble { border-bottom-right-radius: var(--radius); }
+  .msg.grouped.them .bubble { border-bottom-left-radius: var(--radius); }
+
+  .sidemeta {
+    display: flex; flex-direction: column; font-size: 10px; line-height: 1.3;
+    color: var(--muted); white-space: nowrap;
+  }
+  .msg.me .sidemeta { align-items: flex-end; text-align: right; }
+  .sidemeta.retry { color: var(--bad); cursor: pointer; text-decoration: underline; }
+
+  .meta { font-size: 11px; color: var(--muted); margin: 1px 0 0 4px; }
+  .meta a { color: inherit; }
+  .meta .copybtn { cursor: pointer; margin-left: 6px; }
   .lowbatt { color: var(--bad); }
-  .msg.me   { align-self: flex-end; align-items: flex-end; }
-  .msg.me .bubble   { background: var(--accent); color: var(--accent-text); border-bottom-right-radius: 4px; }
-  .msg.them { align-self: flex-start; align-items: flex-start; }
-  .msg.them .bubble { background: var(--bubble-them); border-bottom-left-radius: 4px; }
-  .msg.them .who { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 4px 2px; cursor: pointer; }
+
+  .daypill {
+    align-self: center; font-size: 11px; color: var(--muted);
+    background: var(--daypill-bg); padding: 3px 12px; border-radius: 999px;
+    margin: 6px 0;
+  }
 
   .sys {
     align-self: center; font-size: 12px; color: var(--muted);
@@ -881,6 +930,8 @@ function addSystem(text) {
   el.className = "sys";
   el.textContent = text;
   els.log.appendChild(el);
+  lastSender = null;   // a system line breaks the current turn
+  lastMinuteKey = "";
   scrollLog(false);
 }
 
@@ -904,6 +955,7 @@ function clearChat() {
   try { localStorage.removeItem(HISTORY_KEY); } catch (_) {}
   els.log.replaceChildren();
   lastMsgEpoch = 0;
+  lastSender = null; lastGroupTs = 0; lastMinuteKey = ""; lastDay = ""; lastTimeEl = null;
   bubblesById.clear();
   for (const t of ackTimers.values()) clearTimeout(t);
   ackTimers.clear();
@@ -925,12 +977,42 @@ function renderHistory() {
   addSystem("— earlier session ↑ —");
 }
 
-let lastMsgEpoch = 0;   // for >1 h time dividers in the log
-const DELIVERY_TIPS = {
-  "⏳": "Waiting for the board to transmit",
-  "✓ sent": "Transmitted over the air — waiting for the recipient's confirmation",
-  "✓✓ delivered": "Delivered — the recipient's board confirmed receipt",
+let lastMsgEpoch = 0;   // (kept for compatibility; day pills now mark boundaries)
+// ---------- Message grouping state (LINE-style turns) ----------
+let lastSender = null;     // peer name for "them", "\u0000me" for "me"
+let lastGroupTs = 0;       // ts of the previous message (5-min group window)
+let lastMinuteKey = "";    // sender+HH:MM — show the time once per minute-run
+let lastDay = "";          // calendar-day key for day pills
+let lastTimeEl = null;     // previous message's time node, hidden when grouped
+const GROUP_MS = 5 * 60000;
+
+// Word-based delivery receipts (LINE-style), replacing ⏳/✓/✓✓.
+const RECEIPT = { sending: "Sending", sent: "Sent", read: "Read", failed: "Not sent · retry" };
+const RECEIPT_TIPS = {
+  Sending: "Waiting for the board to transmit",
+  Sent: "Transmitted over the air — waiting for the recipient's confirmation",
+  Read: "Delivered — the recipient's board confirmed receipt",
+  "Not sent · retry": "No delivery confirmation arrived — click to resend",
 };
+
+// Deterministic avatar from a name: hashed hue + first initial.
+function avatarColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+  return `hsl(${h} 60% 45%)`;
+}
+function avatarInitial(name) {
+  const c = (name || "").trim()[0];
+  return c ? c.toUpperCase() : "?";
+}
+function dayKey(ts) { return new Date(ts).toDateString(); }
+function fmtDay(ts) {
+  const d = new Date(ts), today = new Date();
+  const yest = new Date(today); yest.setDate(today.getDate() - 1);
+  if (dayKey(ts) === today.toDateString()) return "Today";
+  if (dayKey(ts) === yest.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+}
 
 // Geo meta line: link to maps + coordinate copy (only when we have coords).
 // Battery is dropped here — it's continuous state the telemetry panel owns.
@@ -967,60 +1049,107 @@ function geoLine(pos) {
 function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore }) {
   const when = time || timeNow();
   const msgTs = restore ? ts : Date.now();
-  if (msgTs) {
-    // time divider when >1 h passed since the previous message
-    if (lastMsgEpoch && msgTs - lastMsgEpoch > 3600000) {
-      const div = document.createElement("div");
-      div.className = "sys";
-      div.textContent = new Date(msgTs).toLocaleString([],
-        { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-      els.log.appendChild(div);
-    }
-    lastMsgEpoch = msgTs;
-  }
-  const wrap = document.createElement("div");
-  wrap.className = "msg " + (mine ? "me" : "them");
+  lastMsgEpoch = msgTs || lastMsgEpoch;
 
+  // Day-divider pill on a new calendar day.
+  if (msgTs && dayKey(msgTs) !== lastDay) {
+    const pill = document.createElement("div");
+    pill.className = "daypill";
+    pill.textContent = fmtDay(msgTs);
+    els.log.appendChild(pill);
+    lastDay = dayKey(msgTs);
+    lastSender = null;   // a divider breaks the current turn
+  }
+
+  // Group consecutive messages from the same sender within GROUP_MS.
+  const sk = mine ? "\u0000me" : from;
+  const grouped = sk === lastSender && msgTs && (msgTs - lastGroupTs < GROUP_MS);
+
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + (mine ? "me" : "them") + (grouped ? " grouped" : "");
+
+  // Avatar (them only; kept as an invisible spacer when grouped).
   if (!mine) {
+    const av = document.createElement("div");
+    av.className = "avatar";
+    av.style.background = avatarColor(from || "?");
+    av.textContent = avatarInitial(from);
+    av.title = "Show in telemetry";
+    av.addEventListener("click", () => focusPeer(from));
+    wrap.appendChild(av);
+  }
+
+  const content = document.createElement("div");
+  content.className = "content";
+
+  if (!mine && !grouped) {
     const who = document.createElement("div");
     who.className = "who";
     who.textContent = from;
     who.title = "Show in telemetry";
     who.addEventListener("click", () => focusPeer(from));
-    wrap.appendChild(who);
+    content.appendChild(who);
   }
+
+  const line = document.createElement("div");
+  line.className = "line";
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   bubble.textContent = text;
-  wrap.appendChild(bubble);
 
-  const meta = document.createElement("div");
-  meta.className = "meta";
-  meta.textContent = when;
-  if (mine && !restore) { meta.textContent = `${when}  ·  ⏳`; meta.title = DELIVERY_TIPS["⏳"]; }
-  wrap.appendChild(meta);
+  const sidemeta = document.createElement("div");
+  sidemeta.className = "sidemeta";
+  let statusEl = null;
+  if (mine && !restore) {
+    statusEl = document.createElement("span");
+    statusEl.className = "status";
+    statusEl.textContent = RECEIPT.sending;
+    statusEl.title = RECEIPT_TIPS[RECEIPT.sending];
+    sidemeta.appendChild(statusEl);
+  }
+  const timeEl = document.createElement("span");
+  timeEl.className = "time";
+  timeEl.textContent = when;
+  sidemeta.appendChild(timeEl);
+
+  // "me" puts meta left of the bubble; "them" puts it to the right.
+  if (mine) line.append(sidemeta, bubble);
+  else line.append(bubble, sidemeta);
+  content.appendChild(line);
+
+  // Show the timestamp once per same-sender, same-minute run.
+  const mk = sk + when;
+  if (mk === lastMinuteKey && lastTimeEl) lastTimeEl.style.display = "none";
+  lastTimeEl = timeEl;
+  lastMinuteKey = mk;
 
   if (!mine && pos) {
     const geo = geoLine(pos);
-    if (geo) wrap.appendChild(geo);
+    if (geo) content.appendChild(geo);
   }
 
+  wrap.appendChild(content);
   els.log.appendChild(wrap);
+
   if (mine && !restore && id !== undefined) {
-    bubblesById.set(id, { meta, time: when, text, done: false });
-    meta.addEventListener("click", () => retrySend(id, meta));
+    bubblesById.set(id, { statusEl, sidemetaEl: sidemeta, time: when, text, done: false });
+    sidemeta.addEventListener("click", () => retrySend(id, sidemeta));
   }
   if (!restore) saveHistory({ mine, from, text, time: when, ts: msgTs, pos });
+
+  lastSender = sk;
+  lastGroupTs = msgTs || lastGroupTs;
   scrollLog(mine);
 }
 
-function setDelivery(id, mark, done) {
+function setDelivery(id, key, done) {
   const b = bubblesById.get(id);
-  if (!b) return;
-  b.meta.textContent = `${b.time}  ·  ${mark}`;
-  b.meta.title = DELIVERY_TIPS[mark] || "";
-  b.meta.classList.remove("retry");
+  if (!b || !b.statusEl) return;
+  const word = RECEIPT[key] || key;
+  b.statusEl.textContent = word;
+  b.statusEl.title = RECEIPT_TIPS[word] || "";
+  b.sidemetaEl.classList.remove("retry");
   if (done) {
     b.done = true;
     clearAckTimer(id);
@@ -1038,25 +1167,26 @@ function armAckTimer(id) {
   ackTimers.set(id, setTimeout(() => {
     ackTimers.delete(id);
     const b = bubblesById.get(id);
-    if (!b || b.done) return;
-    b.meta.textContent = `${b.time}  ·  ✗ not delivered — click to retry`;
-    b.meta.title = "No delivery confirmation arrived — click to resend";
-    b.meta.classList.add("retry");
+    if (!b || b.done || !b.statusEl) return;
+    b.statusEl.textContent = RECEIPT.failed;
+    b.statusEl.title = RECEIPT_TIPS[RECEIPT.failed];
+    b.sidemetaEl.classList.add("retry");
   }, ACK_FAIL_MS));
 }
 
-function retrySend(oldId, meta) {
+function retrySend(oldId, sidemeta) {
   const b = bubblesById.get(oldId);
-  if (!b || b.done || !meta.classList.contains("retry") || !connected) return;
+  if (!b || b.done || !sidemeta.classList.contains("retry") || !connected) return;
   bubblesById.delete(oldId);
   clearAckTimer(oldId);
   const id = ++webMsgId;
-  b.time = timeNow();
   bubblesById.set(id, b);
-  meta.classList.remove("retry");
-  meta.textContent = `${b.time}  ·  ⏳`;
-  meta.title = DELIVERY_TIPS["⏳"];
-  meta.addEventListener("click", () => retrySend(id, meta), { once: false });
+  sidemeta.classList.remove("retry");
+  if (b.statusEl) {
+    b.statusEl.textContent = RECEIPT.sending;
+    b.statusEl.title = RECEIPT_TIPS[RECEIPT.sending];
+  }
+  sidemeta.addEventListener("click", () => retrySend(id, sidemeta), { once: false });
   writeLine({ t: "tx", id, text: b.text });
   armAckTimer(id);
 }
@@ -1112,8 +1242,8 @@ function handleBoardEvent(m) {
       drawRoster();   // distances depend on our own position
       renderTelemetry();
       break;
-    case "sent": setDelivery(m.id, "✓ sent"); armAckTimer(m.id); break;
-    case "ack":  setDelivery(m.id, "✓✓ delivered", true); break;
+    case "sent": setDelivery(m.id, "sent"); armAckTimer(m.id); break;
+    case "ack":  setDelivery(m.id, "read", true); break;
     case "err":  addSystem(`Board: ${m.msg}`); break;
   }
 }
