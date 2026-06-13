@@ -124,32 +124,31 @@
   #log > :first-child { margin-top: auto; }
   @media (prefers-reduced-motion: reduce) { #log { scroll-behavior: auto; } }
 
-  .msg { max-width: 86%; display: flex; gap: 8px; align-items: flex-end; }
-  .msg + .msg { margin-top: 10px; }
+  .msg { max-width: 78%; display: flex; gap: 8px; align-items: flex-end; }
+  .msg + .msg { margin-top: 9px; }
   .msg.grouped { margin-top: 2px; }
   .msg.them { align-self: flex-start; }
   .msg.me   { align-self: flex-end; }
 
   .avatar {
-    width: 32px; height: 32px; border-radius: 50%; flex: 0 0 auto;
+    width: 30px; height: 30px; border-radius: 50%; flex: 0 0 auto;
     display: flex; align-items: center; justify-content: center;
-    color: #fff; font-size: 14px; font-weight: 600; user-select: none;
+    color: #fff; font-size: 13px; font-weight: 600; user-select: none;
   }
   .msg.grouped .avatar { visibility: hidden; }
 
   .content { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+  .msg.me .content { align-items: flex-end; }
   .msg.them .who {
     font-size: 12px; font-weight: 600; color: var(--muted);
     margin: 0 0 1px 4px; cursor: pointer;
   }
 
-  .line { display: flex; align-items: flex-end; gap: 6px; }
-  .msg.me .line { justify-content: flex-end; }
-
   .bubble {
-    padding: 8px 12px; border-radius: var(--radius);
+    padding: 7px 11px; border-radius: var(--radius); max-width: 100%;
     white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
   }
+  .bubble::after { content: ""; display: block; clear: both; }
   .msg.me .bubble {
     background: var(--bubble-me); color: var(--bubble-me-text);
     border-bottom-right-radius: 4px;
@@ -162,12 +161,14 @@
   .msg.grouped.me   .bubble { border-bottom-right-radius: var(--radius); }
   .msg.grouped.them .bubble { border-bottom-left-radius: var(--radius); }
 
-  .sidemeta {
-    display: flex; flex-direction: column; font-size: 10px; line-height: 1.3;
-    color: var(--muted); white-space: nowrap;
+  /* Time + receipt live INSIDE the bubble (bottom-right), so the conversation
+     reads top-to-bottom instead of jumping out to side columns. */
+  .bmeta {
+    float: right; margin: 7px -2px 0 10px;
+    font-size: 10px; line-height: 1; white-space: nowrap; color: var(--muted);
   }
-  .msg.me .sidemeta { align-items: flex-end; text-align: right; }
-  .sidemeta.retry { color: var(--bad); cursor: pointer; text-decoration: underline; }
+  .msg.me .bmeta { color: rgba(255,255,255,.8); }
+  .bmeta.retry { color: #fff; text-decoration: underline; cursor: pointer; }
 
   .meta { font-size: 11px; color: var(--muted); margin: 1px 0 0 4px; }
   .meta a { color: inherit; }
@@ -922,7 +923,6 @@ function addSystem(text) {
   el.textContent = text;
   els.log.appendChild(el);
   lastSender = null;   // a system line breaks the current turn
-  lastMinuteKey = "";
   scrollLog(false);
 }
 
@@ -946,7 +946,7 @@ function clearChat() {
   try { localStorage.removeItem(HISTORY_KEY); } catch (_) {}
   els.log.replaceChildren();
   lastMsgEpoch = 0;
-  lastSender = null; lastGroupTs = 0; lastMinuteKey = ""; lastDay = ""; lastTimeEl = null;
+  lastSender = null; lastGroupTs = 0; lastDay = "";
   bubblesById.clear();
   for (const t of ackTimers.values()) clearTimeout(t);
   ackTimers.clear();
@@ -972,9 +972,7 @@ let lastMsgEpoch = 0;   // (kept for compatibility; day pills now mark boundarie
 // ---------- Message grouping state (LINE-style turns) ----------
 let lastSender = null;     // peer name for "them", "\u0000me" for "me"
 let lastGroupTs = 0;       // ts of the previous message (5-min group window)
-let lastMinuteKey = "";    // sender+HH:MM — show the time once per minute-run
 let lastDay = "";          // calendar-day key for day pills
-let lastTimeEl = null;     // previous message's time node, hidden when grouped
 const GROUP_MS = 5 * 60000;
 
 // Word-based delivery receipts (LINE-style), replacing ⏳/✓/✓✓.
@@ -1082,38 +1080,29 @@ function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore })
     content.appendChild(who);
   }
 
-  const line = document.createElement("div");
-  line.className = "line";
-
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.textContent = text;
+  const btext = document.createElement("span");
+  btext.className = "btext";
+  btext.textContent = text;
+  bubble.appendChild(btext);
 
-  const sidemeta = document.createElement("div");
-  sidemeta.className = "sidemeta";
+  // Time + receipt float inside the bubble's bottom-right corner.
+  const bmeta = document.createElement("span");
+  bmeta.className = "bmeta";
   let statusEl = null;
   if (mine && !restore) {
     statusEl = document.createElement("span");
     statusEl.className = "status";
     statusEl.textContent = RECEIPT.sending;
-    statusEl.title = RECEIPT_TIPS[RECEIPT.sending];
-    sidemeta.appendChild(statusEl);
+    bmeta.append(statusEl, document.createTextNode(" · "));
   }
   const timeEl = document.createElement("span");
   timeEl.className = "time";
   timeEl.textContent = when;
-  sidemeta.appendChild(timeEl);
-
-  // "me" puts meta left of the bubble; "them" puts it to the right.
-  if (mine) line.append(sidemeta, bubble);
-  else line.append(bubble, sidemeta);
-  content.appendChild(line);
-
-  // Show the timestamp once per same-sender, same-minute run.
-  const mk = sk + when;
-  if (mk === lastMinuteKey && lastTimeEl) lastTimeEl.style.display = "none";
-  lastTimeEl = timeEl;
-  lastMinuteKey = mk;
+  bmeta.appendChild(timeEl);
+  bubble.appendChild(bmeta);
+  content.appendChild(bubble);
 
   if (!mine && pos) {
     const geo = geoLine(pos);
@@ -1124,8 +1113,8 @@ function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore })
   els.log.appendChild(wrap);
 
   if (mine && !restore && id !== undefined) {
-    bubblesById.set(id, { statusEl, sidemetaEl: sidemeta, time: when, text, done: false });
-    sidemeta.addEventListener("click", () => retrySend(id, sidemeta));
+    bubblesById.set(id, { statusEl, bmetaEl: bmeta, time: when, text, done: false });
+    bmeta.addEventListener("click", () => retrySend(id, bmeta));
   }
   if (!restore) saveHistory({ mine, from, text, time: when, ts: msgTs, pos });
 
@@ -1140,7 +1129,7 @@ function setDelivery(id, key, done) {
   const word = RECEIPT[key] || key;
   b.statusEl.textContent = word;
   b.statusEl.title = RECEIPT_TIPS[word] || "";
-  b.sidemetaEl.classList.remove("retry");
+  b.bmetaEl.classList.remove("retry");
   if (done) {
     b.done = true;
     clearAckTimer(id);
@@ -1161,23 +1150,23 @@ function armAckTimer(id) {
     if (!b || b.done || !b.statusEl) return;
     b.statusEl.textContent = RECEIPT.failed;
     b.statusEl.title = RECEIPT_TIPS[RECEIPT.failed];
-    b.sidemetaEl.classList.add("retry");
+    b.bmetaEl.classList.add("retry");
   }, ACK_FAIL_MS));
 }
 
-function retrySend(oldId, sidemeta) {
+function retrySend(oldId, bmeta) {
   const b = bubblesById.get(oldId);
-  if (!b || b.done || !sidemeta.classList.contains("retry") || !connected) return;
+  if (!b || b.done || !bmeta.classList.contains("retry") || !connected) return;
   bubblesById.delete(oldId);
   clearAckTimer(oldId);
   const id = ++webMsgId;
   bubblesById.set(id, b);
-  sidemeta.classList.remove("retry");
+  bmeta.classList.remove("retry");
   if (b.statusEl) {
     b.statusEl.textContent = RECEIPT.sending;
     b.statusEl.title = RECEIPT_TIPS[RECEIPT.sending];
   }
-  sidemeta.addEventListener("click", () => retrySend(id, sidemeta), { once: false });
+  bmeta.addEventListener("click", () => retrySend(id, bmeta), { once: false });
   writeLine({ t: "tx", id, text: b.text });
   armAckTimer(id);
 }
