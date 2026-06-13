@@ -128,9 +128,9 @@
   .msg + .msg { margin-top: 9px; }
   .msg.grouped { margin-top: 2px; }
   /* Single left rail: every message reads top-to-bottom down the left edge.
-     Own messages indent to line up under incoming bubbles and stay green so
-     they're still distinct — no jumping out to the far right. */
-  .msg.me { padding-left: 38px; }
+     Own messages indent further so they read as "yours" and stay green —
+     no jumping out to the far right. */
+  .msg.me { padding-left: 72px; }
 
   .avatar {
     width: 30px; height: 30px; border-radius: 50%; flex: 0 0 auto;
@@ -322,6 +322,8 @@
       <div id="telemMine"></div>
       <h3 id="telemPeerName">Peer</h3>
       <div id="telemPeer"></div>
+      <h3>This browser</h3>
+      <div id="telemBrowser"></div>
     </div>
   </div>
 </div>
@@ -346,7 +348,7 @@ const els = {
   roster: $("roster"), linkpill: $("linkpill"), soundBtn: $("soundBtn"),
   resetBtn: $("resetBtn"),
   telemMine: $("telemMine"), telemPeer: $("telemPeer"),
-  telemPeerName: $("telemPeerName"),
+  telemPeerName: $("telemPeerName"), telemBrowser: $("telemBrowser"),
 };
 
 let port = null, reader = null, writer = null;
@@ -794,11 +796,189 @@ function buildTelemSkeleton() {
   telemEls.peerBatt   = thRow(pp, "Battery");
   telemEls.peerSignal = thRow(pp, "Signal");
   telemEls.peerTrail  = thRow(pp, "Trail");
+
+  const br = els.telemBrowser;
+  br.replaceChildren();
+  telemEls.brHead    = thHead(br);
+  telemEls.brDevice  = thRow(br, "Device");
+  telemEls.brCpu     = thRow(br, "CPU / RAM", "Logical cores · approx device memory");
+  telemEls.brGpu     = thRow(br, "GPU", "Unmasked WebGL renderer");
+  telemEls.brDisplay = thRow(br, "Display", "Screen · pixel ratio · colour depth");
+  telemEls.brWindow  = thRow(br, "Window");
+  telemEls.brInput   = thRow(br, "Input");
+  telemEls.brTheme   = thRow(br, "Theme");
+  telemEls.brLang    = thRow(br, "Languages");
+  telemEls.brTz      = thRow(br, "Time zone");
+  telemEls.brClock   = thRow(br, "Local time");
+  telemEls.brNet     = thRow(br, "Network", "navigator.connection — coarse, Chromium only");
+  telemEls.brBatt    = thRow(br, "Battery");
+  telemEls.brStorage = thRow(br, "Storage", "Origin storage estimate (quota is approximate)");
+  telemEls.brMedia   = thRow(br, "Media in/out", "Counts only — labels need permission");
+  telemEls.brApis    = thRow(br, "Web APIs");
+  telemEls.brPrivacy = thRow(br, "Privacy");
+  fillBrowserStatic();
+}
+
+// ---------- Client / browser info (local only — never sent over the air) ----------
+let browserFilled = false;
+let lastInputTs = Date.now();
+["pointermove", "pointerdown", "keydown", "wheel", "touchstart", "scroll"].forEach(ev =>
+  window.addEventListener(ev, () => { lastInputTs = Date.now(); }, { passive: true }));
+["resize", "online", "offline", "visibilitychange"].forEach(ev =>
+  window.addEventListener(ev, () => { if (radarOn) renderBrowserDynamic(); }));
+
+function fmtBytes(n) {
+  if (n === undefined || n === null) return "?";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n < 10 && i ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+}
+
+function gpuRenderer() {
+  try {
+    const gl = document.createElement("canvas").getContext("webgl")
+            || document.createElement("canvas").getContext("experimental-webgl");
+    if (!gl) return "";
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    const r = (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+                   : gl.getParameter(gl.RENDERER)) || "";
+    return r.toString().replace(/^ANGLE\s*\(/i, "").replace(/\)$/, "").trim();
+  } catch (_) { return ""; }
+}
+
+function uaFallback() {
+  const ua = navigator.userAgent;
+  let m;
+  const browser =
+    (m = ua.match(/Firefox\/([\d.]+)/)) ? "Firefox " + m[1] :
+    (m = ua.match(/Edg\/([\d.]+)/))     ? "Edge " + m[1] :
+    (m = ua.match(/OPR\/([\d.]+)/))     ? "Opera " + m[1] :
+    (m = ua.match(/Chrome\/([\d.]+)/))  ? "Chrome " + m[1] :
+    (m = ua.match(/Version\/([\d.]+).*Safari/)) ? "Safari " + m[1] : "Browser";
+  const os =
+    /Mac OS X/.test(ua) ? "macOS" : /Windows NT/.test(ua) ? "Windows" :
+    /Android/.test(ua) ? "Android" : /iPhone|iPad|iPod/.test(ua) ? "iOS" :
+    /Linux/.test(ua) ? "Linux" : "";
+  return { browser, os, osVer: "", arch: "", model: "" };
+}
+
+async function clientIdentity() {
+  const d = navigator.userAgentData;
+  if (!d) return uaFallback();
+  const real = list => (list || []).find(x =>
+        !/Not.?A.?Brand/i.test(x.brand) && !/Chromium/i.test(x.brand))
+      || (list || []).find(x => /Chromium/i.test(x.brand));
+  let browser = "", osVer = "", arch = "", model = "";
+  const os = d.platform || "";
+  const b = real(d.brands);
+  if (b) browser = `${b.brand} ${b.version}`;
+  try {
+    const h = await d.getHighEntropyValues(
+      ["architecture", "bitness", "platformVersion", "model", "fullVersionList"]);
+    const fb = real(h.fullVersionList);
+    if (fb) browser = `${fb.brand} ${fb.version}`;
+    osVer = (h.platformVersion || "").split(".")[0] || "";
+    arch = h.architecture ? h.architecture + (h.bitness ? "-" + h.bitness : "") : "";
+    model = h.model || "";
+  } catch (_) {}
+  return { browser, os, osVer, arch, model };
+}
+
+function fillBrowserStatic() {
+  if (browserFilled) return;
+  browserFilled = true;
+  const set = (el, v) => { if (el) el.textContent = v || DASH; };
+
+  clientIdentity().then(id => {
+    const osLabel = (id.os || "") + (id.osVer ? " " + id.osVer : "");
+    setHead(telemEls.brHead, "good", id.browser || "This browser", osLabel);
+    const dev = [];
+    if (id.model) dev.push(id.model);
+    if (id.arch) dev.push(id.arch);
+    if (!dev.length) dev.push(navigator.maxTouchPoints > 1 ? "touch device" : "desktop");
+    set(telemEls.brDevice, dev.join(" · "));
+  });
+
+  set(telemEls.brCpu,
+    `${navigator.hardwareConcurrency || "?"} cores` +
+    (navigator.deviceMemory ? ` · ${navigator.deviceMemory}+ GB` : ""));
+  set(telemEls.brGpu, gpuRenderer());
+  set(telemEls.brDisplay,
+    `${screen.width}×${screen.height} · ${window.devicePixelRatio}× · ${screen.colorDepth}-bit`);
+  set(telemEls.brLang, (navigator.languages || [navigator.language]).join(", "));
+  const off = -new Date().getTimezoneOffset();
+  set(telemEls.brTz,
+    `${Intl.DateTimeFormat().resolvedOptions().timeZone || "?"} · GMT${off >= 0 ? "+" : ""}${off / 60}`);
+
+  const apis = [
+    ["Serial", "serial" in navigator], ["BT", "bluetooth" in navigator],
+    ["USB", "usb" in navigator], ["HID", "hid" in navigator],
+    ["Geo", "geolocation" in navigator], ["WebGPU", "gpu" in navigator],
+  ].filter(([, ok]) => ok).map(([n]) => n);
+  set(telemEls.brApis, apis.join(" · "));
+
+  const dnt = navigator.doNotTrack || window.doNotTrack;
+  set(telemEls.brPrivacy,
+    `cookies ${navigator.cookieEnabled ? "on" : "off"} · DNT ${dnt === "1" ? "on" : "off"}`);
+
+  if (navigator.storage && navigator.storage.estimate) {
+    navigator.storage.estimate()
+      .then(e => set(telemEls.brStorage, `${fmtBytes(e.usage)} / ${fmtBytes(e.quota)}`))
+      .catch(() => {});
+  }
+  if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+    navigator.mediaDevices.enumerateDevices().then(list => {
+      const n = k => list.filter(x => x.kind === k).length;
+      set(telemEls.brMedia, `${n("videoinput")} cam · ${n("audioinput")} mic · ${n("audiooutput")} out`);
+    }).catch(() => {});
+  }
+  if (navigator.getBattery) {
+    navigator.getBattery().then(bat => {
+      const upd = () => set(telemEls.brBatt,
+        `${Math.round(bat.level * 100)}%${bat.charging ? " · charging" : ""}`);
+      upd();
+      bat.addEventListener("levelchange", upd);
+      bat.addEventListener("chargingchange", upd);
+    }).catch(() => {});
+  }
+}
+
+// Live bits only: presence dot, window size, theme, clock, network.
+function renderBrowserDynamic() {
+  if (!telemEls.brHead) return;
+  const idleSec = Math.round((Date.now() - lastInputTs) / 1000);
+  const online = navigator.onLine, hidden = document.hidden;
+  const active = online && !hidden && idleSec < 60;
+  const presence = !online ? "offline"
+    : hidden ? "tab hidden"
+    : idleSec < 60 ? "active"
+    : `idle ${idleSec < 600 ? idleSec + "s" : Math.round(idleSec / 60) + "m"}`;
+  telemEls.brHead.dot.className = "tdot " + (!online ? "bad" : active ? "good" : "warn");
+  telemEls.brHead.sub.textContent = presence;
+
+  telemEls.brWindow.textContent = `${window.innerWidth}×${window.innerHeight}`;
+  telemEls.brInput.textContent =
+    `${matchMedia("(pointer:fine)").matches ? "mouse" : "touch"}` +
+    (navigator.maxTouchPoints ? ` · ${navigator.maxTouchPoints} pts` : "") +
+    (matchMedia("(hover:hover)").matches ? " · hover" : "");
+  telemEls.brTheme.textContent =
+    `${matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"}` +
+    (matchMedia("(prefers-reduced-motion: reduce)").matches ? " · reduced motion" : "");
+  telemEls.brClock.textContent = new Date().toLocaleTimeString();
+
+  const c = navigator.connection;
+  telemEls.brNet.textContent = c
+    ? `${online ? "online" : "offline"} · ${c.effectiveType || "?"}`
+      + (c.downlink ? ` · ${c.downlink} Mbps` : "")
+      + (c.rtt ? ` · ${c.rtt} ms` : "") + (c.saveData ? " · saver" : "")
+    : (online ? "online" : "offline");
 }
 
 function renderTelemetry() {
   if (!radarOn) return;
   buildTelemSkeleton();
+  renderBrowserDynamic();
   const now = Date.now();
 
   // --- my board: same rows every time; missing data shows "—" ---
