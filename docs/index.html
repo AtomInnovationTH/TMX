@@ -50,13 +50,13 @@
   }
 
   header {
-    display: flex; align-items: center; gap: 10px;
-    padding: 10px 16px;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; row-gap: 8px;
+    padding: 10px 14px;
     background: var(--card);
     border-bottom: 1px solid var(--border);
     flex: 0 0 auto;
   }
-  header h1 { font-size: 16px; margin: 0; font-weight: 600; flex: 1; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; flex: 1 1 auto; min-width: 120px; }
   header h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; }
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
@@ -108,18 +108,13 @@
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
   #left { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-  #leftbar {
-    flex: 0 0 auto; display: flex; align-items: center;
-    padding: 8px 16px; border-bottom: 1px solid var(--border);
-  }
-  #leftbarTitle { font-size: 12px; color: var(--muted); font-weight: 600; }
-  #resetBtn { margin-left: auto; padding: 4px 12px; font-size: 13px; }
+  #resetBtn { padding: 4px 12px; font-size: 13px; }
   #right {
     display: flex; flex-direction: column; gap: 12px;
     padding: 12px 12px 12px 0; overflow-y: auto; min-height: 0;
   }
   #log {
-    flex: 1; overflow-y: auto; padding: 16px;
+    flex: 1; overflow-y: auto; padding: 14px 12px;
     display: flex; flex-direction: column;
     background: var(--chat-bg);
     scroll-behavior: smooth;
@@ -129,7 +124,7 @@
   #log > :first-child { margin-top: auto; }
   @media (prefers-reduced-motion: reduce) { #log { scroll-behavior: auto; } }
 
-  .msg { max-width: 82%; display: flex; gap: 8px; align-items: flex-end; }
+  .msg { max-width: 86%; display: flex; gap: 8px; align-items: flex-end; }
   .msg + .msg { margin-top: 10px; }
   .msg.grouped { margin-top: 2px; }
   .msg.them { align-self: flex-start; }
@@ -232,7 +227,7 @@
     border-radius: var(--radius); padding: 10px 14px; flex: 0 0 auto;
   }
   #radarcard { text-align: center; }
-  #radarSvg { width: 100%; height: auto; max-width: 340px; display: block; margin: 0 auto; }
+  #radarSvg { width: 100%; height: auto; max-width: 440px; display: block; margin: 0 auto; }
   #radarcard .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
   #telemetry h3 {
     margin: 6px 0 4px; font-size: 11px; font-weight: 600;
@@ -265,26 +260,16 @@
   .tdot.bad  { background: var(--bad); }
 
   @media (max-width: 900px) {
-    /* Fallback: right column stacks above the chat, like the v1.2 layout */
-    #chat { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+    /* Fallback: single column — chat (with its header) on top, tracker below */
+    #chat { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto; }
     #right {
-      order: -1; flex-direction: row; flex-wrap: wrap; align-items: flex-start;
-      justify-content: center; padding: 12px 16px 0; overflow: visible;
+      flex-direction: row; flex-wrap: wrap; align-items: flex-start;
+      justify-content: center; padding: 12px 16px; overflow: visible;
     }
   }
 </style>
 </head>
 <body>
-
-<header>
-  <h1>LoRa Chat <small id="subtitle">LightTracker · 923.2 MHz</small></h1>
-  <span class="pill" id="gpspill" title="Your LightTracker's GPS">GPS —</span>
-  <span class="pill" id="linkpill" title="Signal strength of the last received message">▂</span>
-  <span class="pill"><span class="dot" id="dot"></span><span id="status">Disconnected</span></span>
-  <button class="ghost" id="soundBtn" style="display:none" title="Message sound">🔔</button>
-  <button class="ghost" id="radarBtn" style="display:none">📡 Radar</button>
-  <button class="ghost" id="reconnect" style="display:none">Reconnect</button>
-</header>
 
 <div id="hero">
   <div class="card" id="connectCard">
@@ -306,10 +291,16 @@
 
 <div id="chat">
   <div id="left">
-    <div id="leftbar">
-      <span id="leftbarTitle">Messages</span>
+    <header>
+      <h1>LoRaChat v1.4 <small id="subtitle">923.2 MHz</small></h1>
+      <span class="pill" id="gpspill" title="Your LightTracker's GPS">GPS —</span>
+      <span class="pill" id="linkpill" title="Signal strength of the last received message">▂</span>
+      <span class="pill"><span class="dot" id="dot"></span><span id="status">Disconnected</span></span>
+      <button class="ghost" id="soundBtn" style="display:none" title="Message sound">🔔</button>
+      <button class="ghost" id="radarBtn" style="display:none">📡 Radar</button>
+      <button class="ghost" id="reconnect" style="display:none">Reconnect</button>
       <button class="ghost" id="resetBtn" title="Clear chat history">Reset</button>
-    </div>
+    </header>
     <div id="roster"></div>
     <div id="log" aria-live="polite"></div>
     <div id="composer">
