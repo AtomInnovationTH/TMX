@@ -58,6 +58,8 @@
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
   .dot.on { background: var(--ok); }
+  .pill.lowbatt { color: var(--bad); border-color: var(--bad); }
+  #linkpill { display: none; letter-spacing: 1px; font-family: monospace; }
 
   button {
     font: inherit; border: 0; border-radius: 10px; cursor: pointer;
@@ -92,8 +94,16 @@
   .card input:focus { outline: 2px solid var(--accent); border-color: transparent; }
   #unsupported { display: none; }
 
-  /* Chat screen */
-  #chat { flex: 1; display: none; flex-direction: column; min-height: 0; }
+  /* Chat screen — two-column desktop layout */
+  #chat {
+    flex: 1; display: none; min-height: 0;
+    grid-template-columns: minmax(0, 1fr) 340px;
+  }
+  #left { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  #right {
+    display: flex; flex-direction: column; gap: 12px;
+    padding: 12px 12px 12px 0; overflow-y: auto; min-height: 0;
+  }
   #log {
     flex: 1; overflow-y: auto; padding: 16px;
     display: flex; flex-direction: column; gap: 8px;
@@ -107,11 +117,15 @@
     white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
   }
   .msg .meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .msg .meta.retry { color: var(--bad); cursor: pointer; text-decoration: underline; }
+  .msg .meta a { color: inherit; }
+  .msg .meta .copybtn { cursor: pointer; margin-left: 6px; }
+  .lowbatt { color: var(--bad); }
   .msg.me   { align-self: flex-end; align-items: flex-end; }
   .msg.me .bubble   { background: var(--accent); color: var(--accent-text); border-bottom-right-radius: 4px; }
   .msg.them { align-self: flex-start; align-items: flex-start; }
   .msg.them .bubble { background: var(--bubble-them); border-bottom-left-radius: 4px; }
-  .msg.them .who { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 4px 2px; }
+  .msg.them .who { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 4px 2px; cursor: pointer; }
 
   .sys {
     align-self: center; font-size: 12px; color: var(--muted);
@@ -144,14 +158,53 @@
     box-shadow: 0 2px 12px rgba(0,0,0,.25);
   }
 
-  /* Radar */
-  #radarwrap { display: none; justify-content: center; padding: 12px 16px 0; flex: 0 0 auto; }
-  #radarwrap.show { display: flex; }
-  #radar {
-    background: var(--card); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 10px 14px; text-align: center;
+  /* Peer roster */
+  #roster {
+    display: none; gap: 8px; overflow-x: auto;
+    padding: 8px 16px 0; flex: 0 0 auto;
   }
-  #radar .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  #roster.show { display: flex; }
+  .chip {
+    flex: 0 0 auto; display: flex; flex-direction: column;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 5px 12px;
+    font-size: 12px; line-height: 1.4; white-space: nowrap;
+    cursor: pointer;
+  }
+  .chip b { font-size: 13px; }
+  .chip .sub { color: var(--muted); }
+  .chip.stale { opacity: .55; }
+  .chip.focused { border-color: var(--accent); }
+
+  /* Right column: radar + telemetry */
+  #radarcard, #telemetry {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 10px 14px; flex: 0 0 auto;
+  }
+  #radarcard { text-align: center; }
+  #radarcard .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  #telemetry h3 {
+    margin: 6px 0 4px; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
+  }
+  #telemetry h3:first-child { margin-top: 2px; }
+  .trow {
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: 10px; font-size: 13px; padding: 2px 0;
+  }
+  .trow .tl { color: var(--muted); flex: 0 0 auto; }
+  .trow .tv { text-align: right; overflow-wrap: anywhere; min-width: 0; }
+  .tv.click { cursor: pointer; }
+  .tempty { color: var(--muted); font-size: 13px; padding: 2px 0; }
+
+  @media (max-width: 900px) {
+    /* Fallback: right column stacks above the chat, like the v1.2 layout */
+    #chat { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+    #right {
+      order: -1; flex-direction: row; flex-wrap: wrap; align-items: flex-start;
+      justify-content: center; padding: 12px 16px 0; overflow: visible;
+    }
+  }
 </style>
 </head>
 <body>
@@ -159,7 +212,9 @@
 <header>
   <h1>LoRa Chat <small id="subtitle">LightTracker · 923.2 MHz</small></h1>
   <span class="pill" id="gpspill" title="Your LightTracker's GPS">GPS —</span>
+  <span class="pill" id="linkpill" title="Signal strength of the last received message">▂</span>
   <span class="pill"><span class="dot" id="dot"></span><span id="status">Disconnected</span></span>
+  <button class="ghost" id="soundBtn" style="display:none" title="Message sound">🔔</button>
   <button class="ghost" id="radarBtn" style="display:none">📡 Radar</button>
   <button class="ghost" id="reconnect" style="display:none">Reconnect</button>
 </header>
@@ -183,19 +238,28 @@
 </div>
 
 <div id="chat">
-  <div id="radarwrap">
-    <div id="radar">
-      <svg id="radarSvg" width="250" height="250" role="img" aria-label="Range and direction radar"></svg>
-      <div class="meta" id="radarMsg"></div>
+  <div id="left">
+    <div id="roster"></div>
+    <div id="log" aria-live="polite"></div>
+    <div id="composer">
+      <div class="inputwrap">
+        <textarea id="text" rows="1" maxlength="180" placeholder="Message…" disabled></textarea>
+        <span id="count">180</span>
+      </div>
+      <button id="send" disabled>Send</button>
     </div>
   </div>
-  <div id="log" aria-live="polite"></div>
-  <div id="composer">
-    <div class="inputwrap">
-      <textarea id="text" rows="1" maxlength="180" placeholder="Message…" disabled></textarea>
-      <span id="count">180</span>
+  <div id="right">
+    <div id="radarcard">
+      <svg id="radarSvg" width="300" height="300" role="img" aria-label="Range and direction radar"></svg>
+      <div class="meta" id="radarMsg"></div>
     </div>
-    <button id="send" disabled>Send</button>
+    <div id="telemetry">
+      <h3>My board</h3>
+      <div id="telemMine"></div>
+      <h3 id="telemPeerName">Peer</h3>
+      <div id="telemPeer"></div>
+    </div>
   </div>
 </div>
 
@@ -206,6 +270,7 @@
 
 const MAX_TEXT = 180;
 const LIGHTTRACKER_VID = 0x2A03;
+const LOW_BATT_V = 3.5;   // LiPo getting low — surface it
 
 const $ = id => document.getElementById(id);
 const els = {
@@ -215,8 +280,11 @@ const els = {
   dot: $("dot"), status: $("status"), reconnect: $("reconnect"),
   text: $("text"), send: $("send"), count: $("count"),
   newmsgs: $("newmsgs"), subtitle: $("subtitle"), gpspill: $("gpspill"),
-  radarBtn: $("radarBtn"), radarwrap: $("radarwrap"),
+  radarBtn: $("radarBtn"), right: $("right"),
   radarSvg: $("radarSvg"), radarMsg: $("radarMsg"),
+  roster: $("roster"), linkpill: $("linkpill"), soundBtn: $("soundBtn"),
+  telemMine: $("telemMine"), telemPeer: $("telemPeer"),
+  telemPeerName: $("telemPeerName"),
 };
 
 let port = null, reader = null, writer = null;
@@ -224,7 +292,66 @@ let connected = false;
 let myName = localStorage.getItem("lorachat.name") || "";
 let webMsgId = 0;
 let myPos = null;   // {lat,lon,alt} from our own board's GPS
-const bubblesById = new Map();   // webMsgId -> meta element for ✓ updates
+let myGps = null;   // full last "gps" event from the board (telemetry panel)
+const battHist = [];             // [{t, v}] own battery, ~10 min window
+const BATT_HIST_MS = 10 * 60000;
+const bubblesById = new Map();   // webMsgId -> {meta, time, text, done} for ✓/retry
+const ackTimers = new Map();     // webMsgId -> failure timeout
+const ACK_FAIL_MS = 12000;       // board acks within ~5 s incl. its own retry
+
+// ---------- Unread badge + sound ----------
+const BASE_TITLE = document.title;
+let unread = 0;
+let soundOn = localStorage.getItem("lorachat.sound") !== "0";
+let audioCtx = null;
+
+function beep() {
+  if (!soundOn) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    const t = audioCtx.currentTime;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = "sine"; o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t); o.stop(t + 0.3);
+  } catch (_) { /* audio unavailable */ }
+}
+
+function notifyIncoming() {
+  if (document.hidden) {
+    unread++;
+    document.title = `(${unread}) ${BASE_TITLE}`;
+  }
+  beep();
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { unread = 0; document.title = BASE_TITLE; }
+});
+
+function applySoundBtn() {
+  els.soundBtn.textContent = soundOn ? "🔔" : "🔕";
+  els.soundBtn.title = soundOn ? "Message sound on" : "Message sound off";
+}
+els.soundBtn.addEventListener("click", () => {
+  soundOn = !soundOn;
+  localStorage.setItem("lorachat.sound", soundOn ? "1" : "0");
+  applySoundBtn();
+  beep();   // audible confirmation when turning on
+});
+
+// ---------- Link quality (last received RSSI) ----------
+function updateLink(rssi, snr) {
+  if (rssi === undefined) return;
+  const r = +rssi;
+  const lvl = r > -70 ? 4 : r > -90 ? 3 : r > -105 ? 2 : 1;
+  els.linkpill.style.display = "inline-flex";
+  els.linkpill.textContent = "▂▄▆█".slice(0, lvl);
+  els.linkpill.title = `Last received signal: ${rssi} dBm · SNR ${snr} dB`;
+}
 
 // ---------- Geo helpers ----------
 function haversineM(a, b) {
@@ -269,20 +396,107 @@ function describePeerPos(pos) {
       parts.push(`📍 ${pos.lat.toFixed(5)}, ${pos.lon.toFixed(5)}`);
     }
   }
-  if (pos.batt > 0.5) parts.push(`🔋 ${pos.batt} V`);
+  if (pos.batt > 0.5) parts.push(`🔋 ${pos.batt} V${pos.batt < LOW_BATT_V ? " ⚠" : ""}`);
   return parts.length ? parts.join("  ·  ") : null;
 }
 
-// ---------- Radar (range circle: distance + direction, north up) ----------
-const peers = new Map();   // name -> {lat, lon, alt, batt, ts}
-let radarOn = localStorage.getItem("lorachat.radar") !== "0";  // default on
+// ---------- Peers (roster + radar + telemetry) ----------
+// name -> {lat?, lon?, alt?, batt?, sats, rssi?, snr?, ts,
+//          trail:[{lat,lon}], sig:[rssi…], ext?:{speed,course,hacc,fixType}}
+const peers = new Map();
+let focusedPeer = null;           // telemetry panel focus (click roster/radar)
+let radarOn = localStorage.getItem("lorachat.radar") !== "0";  // right column on/off
 const SVGNS = "http://www.w3.org/2000/svg";
 const PEER_TTL_MS = 15 * 60000;   // drop peers not heard from in 15 min
+const TRAIL_MAX = 20;             // breadcrumb points kept per peer
+const SIG_MAX = 20;               // RSSI sparkline points kept per peer
 
-function notePeer(from, pos) {
-  if (pos && pos.sats > 0) {
-    peers.set(from, { lat: pos.lat, lon: pos.lon, alt: pos.alt, batt: pos.batt, ts: Date.now() });
-    drawRadar();
+function notePeer(from, pos, rssi, snr, ext) {
+  const p = peers.get(from) || { trail: [], sig: [] };
+  if (!p.sig) p.sig = [];
+  p.ts = Date.now();
+  if (rssi !== undefined) {
+    p.rssi = rssi;
+    p.snr = snr;
+    p.sig.push(+rssi);
+    if (p.sig.length > SIG_MAX) p.sig.shift();
+  }
+  if (ext) p.ext = ext;
+  if (pos) {
+    p.batt = pos.batt;
+    p.sats = pos.sats;
+    if (pos.sats > 0) {
+      if (p.lat !== undefined && (p.lat !== pos.lat || p.lon !== pos.lon)) {
+        p.trail.push({ lat: p.lat, lon: p.lon });
+        if (p.trail.length > TRAIL_MAX) p.trail.shift();
+      }
+      p.lat = pos.lat; p.lon = pos.lon; p.alt = pos.alt;
+    }
+  }
+  peers.set(from, p);
+  drawRadar();
+  drawRoster();
+  renderTelemetry();
+}
+
+// Which peer the telemetry panel shows: explicit focus, else most recent
+function focusedTarget() {
+  if (focusedPeer && peers.has(focusedPeer)) return focusedPeer;
+  let best = null, bestTs = 0;
+  for (const [name, p] of peers) if (p.ts > bestTs) { best = name; bestTs = p.ts; }
+  return best;
+}
+
+function focusPeer(name) {
+  focusedPeer = name;
+  drawRoster();
+  renderTelemetry();
+}
+
+function expirePeers() {
+  const now = Date.now();
+  for (const [name, p] of peers) if (now - p.ts > PEER_TTL_MS) peers.delete(name);
+}
+
+function fmtAge(ms) {
+  return ms < 60000 ? "now" : `${Math.round(ms / 60000)} min ago`;
+}
+
+function drawRoster() {
+  expirePeers();
+  const now = Date.now();
+  els.roster.classList.toggle("show", peers.size > 0);
+  els.roster.replaceChildren();
+  const focused = focusedTarget();
+  for (const [name, p] of peers) {
+    const chip = document.createElement("div");
+    chip.className = "chip" + (now - p.ts > 120000 ? " stale" : "")
+                   + (name === focused ? " focused" : "");
+    chip.addEventListener("click", () => focusPeer(name));
+    const b = document.createElement("b");
+    b.textContent = name;
+    chip.appendChild(b);
+    const sub = document.createElement("span");
+    sub.className = "sub";
+    const bits = [];
+    if (p.lat !== undefined && myPos) {
+      const peerPos = { lat: p.lat, lon: p.lon };
+      bits.push(`${fmtDistance(haversineM(myPos, peerPos))} ${fmtBearing(bearingDeg(myPos, peerPos))}`);
+    } else if (p.lat !== undefined) {
+      bits.push("📍 has fix");
+    }
+    bits.push(fmtAge(now - p.ts));
+    sub.textContent = bits.join(" · ");
+    chip.appendChild(sub);
+    if (p.batt > 0.5) {
+      const batt = document.createElement("span");
+      batt.className = "sub" + (p.batt < LOW_BATT_V ? " lowbatt" : "");
+      batt.textContent = `🔋 ${p.batt} V${p.batt < LOW_BATT_V ? " ⚠" : ""}`;
+      chip.appendChild(batt);
+    }
+    chip.title = (p.lat !== undefined ? `${name}: ${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}` : name)
+               + " — click for details";
+    els.roster.appendChild(chip);
   }
 }
 
@@ -303,7 +517,7 @@ function drawRadar() {
   if (!radarOn) return;
   const svg = els.radarSvg;
   svg.replaceChildren();
-  const W = 250, C = W / 2, R = C - 22;
+  const W = 300, C = W / 2, R = C - 22;
   const grid = "stroke:var(--border);fill:none";
   const label = "fill:var(--muted);font-size:10px";
 
@@ -316,25 +530,42 @@ function drawRadar() {
   svg.appendChild(svgEl("text", { x: C - R - 16, y: C + 3, style: label }, "W"));
 
   // expire stale peers
+  expirePeers();
   const now = Date.now();
-  for (const [name, p] of peers) if (now - p.ts > PEER_TTL_MS) peers.delete(name);
 
   if (!myPos) {
     els.radarMsg.textContent = "Waiting for your GPS fix…";
     return;
   }
 
-  const plotted = [...peers.entries()].map(([name, p]) => ({
-    name, p, d: haversineM(myPos, p), b: bearingDeg(myPos, p),
-  }));
+  const plotted = [...peers.entries()]
+    .filter(([, p]) => p.lat !== undefined)
+    .map(([name, p]) => ({
+      name, p, d: haversineM(myPos, p), b: bearingDeg(myPos, p),
+    }));
   const scale = niceScale(Math.max(100, ...plotted.map(x => x.d * 1.15)));
 
   // ring distance labels
   svg.appendChild(svgEl("text", { x: C + 4, y: C - R / 2 - 3, style: label }, fmtDistance(scale / 2)));
   svg.appendChild(svgEl("text", { x: C + 4, y: C - R + 11, style: label }, fmtDistance(scale)));
 
-  // me, at the center
+  // me, at the center — with a heading tick when moving
   svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5, style: "fill:var(--accent)" }));
+  if (myGps && +myGps.speed > 2 && myGps.course !== undefined) {
+    const ca = myGps.course * Math.PI / 180;
+    svg.appendChild(svgEl("line", {
+      x1: C + Math.sin(ca) * 6,  y1: C - Math.cos(ca) * 6,
+      x2: C + Math.sin(ca) * 15, y2: C - Math.cos(ca) * 15,
+      style: "stroke:var(--accent);stroke-width:2.5;stroke-linecap:round",
+    }));
+  }
+
+  // project a lat/lon onto the radar (clamped to the outer ring)
+  const project = pt => {
+    const d = haversineM(myPos, pt), b = bearingDeg(myPos, pt);
+    const r = Math.min(d / scale, 1) * R;
+    return [C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r];
+  };
 
   for (const { name, p, d, b } of plotted) {
     const r = Math.min(d / scale, 1) * R;
@@ -342,7 +573,28 @@ function drawRadar() {
     const y = C - Math.cos(b * Math.PI / 180) * r;
     const age = now - p.ts;
     const g = svgEl("g", { opacity: age > 120000 ? 0.5 : 1 });
+    g.style.cursor = "pointer";
+    g.addEventListener("click", () => focusPeer(name));
+    // breadcrumb trail: where they've been, fading behind the dot
+    if (p.trail.length) {
+      const pts = [...p.trail, { lat: p.lat, lon: p.lon }]
+        .map(pt => project(pt).map(v => v.toFixed(1)).join(","))
+        .join(" ");
+      g.appendChild(svgEl("polyline", {
+        points: pts,
+        style: "fill:none;stroke:var(--ok);stroke-width:1.5;stroke-dasharray:3 3;opacity:.45",
+      }));
+    }
     g.appendChild(svgEl("circle", { cx: x, cy: y, r: 5, style: "fill:var(--ok)" }));
+    // course arrow when the peer reports motion (beacon ext payload)
+    if (p.ext && p.ext.speed > 2 && p.ext.course !== undefined) {
+      const ca = p.ext.course * Math.PI / 180;
+      g.appendChild(svgEl("line", {
+        x1: x + Math.sin(ca) * 6,  y1: y - Math.cos(ca) * 6,
+        x2: x + Math.sin(ca) * 14, y2: y - Math.cos(ca) * 14,
+        style: "stroke:var(--ok);stroke-width:2.5;stroke-linecap:round",
+      }));
+    }
     g.appendChild(svgEl("text", { x, y: y - 9, "text-anchor": "middle",
       style: "fill:var(--text);font-size:11px;font-weight:600" }, name));
     const sub = fmtDistance(d) + (age > 60000 ? ` · ${Math.round(age / 60000)} min ago` : "");
@@ -352,13 +604,158 @@ function drawRadar() {
 
   els.radarMsg.textContent = plotted.length
     ? `North up · outer ring ${fmtDistance(scale)}`
-    : "Peers appear here when their messages arrive";
+    : "Peers appear here as their messages and beacons arrive";
 }
 
 function applyRadarVisibility() {
-  els.radarwrap.classList.toggle("show", radarOn);
-  els.radarBtn.textContent = radarOn ? "📡 Radar on" : "📡 Radar";
-  if (radarOn) drawRadar();
+  els.right.style.display = radarOn ? "" : "none";   // whole right column
+  els.radarBtn.textContent = radarOn ? "📡 Panel on" : "📡 Panel";
+  if (radarOn) { drawRadar(); renderTelemetry(); }
+}
+
+// ---------- Telemetry panel ----------
+const FIX_NAMES = { 0: "no fix", 1: "dead reckoning", 2: "2D fix", 3: "3D fix",
+                    4: "GNSS+DR", 5: "time only" };
+
+function battTrendArrow() {
+  if (battHist.length < 2) return "";
+  const span = battHist[battHist.length - 1].t - battHist[0].t;
+  if (span < 3 * 60000) return "";   // need a few minutes of data
+  const dv = battHist[battHist.length - 1].v - battHist[0].v;
+  return dv >= 0.04 ? " ↗" : dv <= -0.04 ? " ↘" : "";
+}
+
+function fmtUptime(s) {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${h} h ${m} min` : m ? `${m} min` : `${s} s`;
+}
+
+// label/value row; returns the value element for extra wiring
+function trow(parent, label, value, title) {
+  const row = document.createElement("div");
+  row.className = "trow";
+  const l = document.createElement("span");
+  l.className = "tl";
+  l.textContent = label;
+  const v = document.createElement("span");
+  v.className = "tv";
+  if (value instanceof Node) v.appendChild(value);
+  else v.textContent = value;
+  if (title) row.title = title;
+  row.append(l, v);
+  parent.appendChild(row);
+  return v;
+}
+
+function tempty(parent, text) {
+  const e = document.createElement("div");
+  e.className = "tempty";
+  e.textContent = text;
+  parent.appendChild(e);
+}
+
+// 20-point RSSI sparkline — same inline-SVG pattern as the radar
+function sparkline(values) {
+  const W = 110, H = 22, LO = -130, HI = -30;
+  const svg = svgEl("svg", { width: W, height: H, style: "vertical-align:middle" });
+  const pts = values.map((v, i) => {
+    const x = values.length > 1 ? i / (values.length - 1) * (W - 2) + 1 : W / 2;
+    const y = H - 1 - (Math.min(Math.max(+v, LO), HI) - LO) / (HI - LO) * (H - 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  svg.appendChild(svgEl("polyline", {
+    points: pts,
+    style: "fill:none;stroke:var(--accent);stroke-width:1.5",
+  }));
+  return svg;
+}
+
+function renderTelemetry() {
+  if (!radarOn) return;
+
+  // --- my board ---
+  const mine = els.telemMine;
+  mine.replaceChildren();
+  const m = myGps;
+  if (!m) {
+    tempty(mine, "Waiting for board data…");
+  } else {
+    let fixStr = FIX_NAMES[m.fixType] ?? `fix ${m.fixType}`;
+    if (m.fix) fixStr += ` · ${m.sats} sats`;
+    if (m.hacc !== undefined) fixStr += ` · ±${m.hacc} m`;
+    trow(mine, "Fix", fixStr,
+         m.pdop !== undefined ? `pDOP ${m.pdop} (lower = better geometry)` : "");
+    if (m.fix) {
+      const coords = `${(+m.lat).toFixed(7)},${(+m.lon).toFixed(7)}`;
+      const v = trow(mine, "Position",
+                     `${(+m.lat).toFixed(5)}, ${(+m.lon).toFixed(5)} · ${m.alt} m`,
+                     "Click to copy coordinates");
+      v.classList.add("click");
+      v.addEventListener("click", () => {
+        navigator.clipboard && navigator.clipboard.writeText(coords);
+      });
+      if (m.speed !== undefined) {
+        trow(mine, "Speed", +m.speed > 2
+          ? `${m.speed} km/h ${fmtBearing(m.course)}`
+          : `${m.speed} km/h`);
+      }
+    }
+    if (m.utc) trow(mine, "UTC", m.utc.replace("T", " ").replace("Z", ""),
+                    "Satellite-synced clock from the board");
+    if (m.batt > 0.5) {
+      trow(mine, "Battery",
+           `${m.batt} V${battTrendArrow()}${m.batt < LOW_BATT_V ? " ⚠ low" : ""}`,
+           "Trend arrow: charging/draining over the last 10 min");
+    }
+    if (m.up !== undefined) trow(mine, "Uptime", fmtUptime(m.up));
+    if (m.tx !== undefined) trow(mine, "Packets", `${m.tx} tx · ${m.rx} rx`);
+    if (m.noise !== undefined) {
+      const n = +m.noise;
+      trow(mine, "Channel",
+           `${m.noise} dBm · ${n < -100 ? "quiet" : n < -85 ? "some traffic" : "busy"}`,
+           "Noise floor while idle — lower is a quieter channel");
+    }
+  }
+
+  // --- focused peer ---
+  const name = focusedTarget();
+  els.telemPeerName.textContent = name ? `Peer · ${name}` : "Peer";
+  const pp = els.telemPeer;
+  pp.replaceChildren();
+  if (!name) {
+    tempty(pp, "No peers heard yet");
+    return;
+  }
+  const p = peers.get(name);
+  const now = Date.now();
+  if (p.lat !== undefined && myPos) {
+    trow(pp, "Distance",
+         `${fmtDistance(haversineM(myPos, p))} ${fmtBearing(bearingDeg(myPos, p))}`);
+  } else if (p.lat !== undefined) {
+    trow(pp, "Position", `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`);
+  }
+  if (p.ext) {
+    trow(pp, "Moving", p.ext.speed > 2
+      ? `${fmtBearing(p.ext.course)} at ${p.ext.speed} km/h`
+      : "stationary");
+    trow(pp, "Their fix",
+         `${FIX_NAMES[p.ext.fixType] ?? p.ext.fixType} · ±${p.ext.hacc} m`);
+  }
+  if (p.alt !== undefined && myPos && myPos.alt !== undefined) {
+    const dAlt = p.alt - myPos.alt;
+    if (Math.abs(dAlt) >= 10) trow(pp, "Alt delta", `${dAlt > 0 ? "+" : ""}${dAlt} m`);
+  }
+  if (p.batt > 0.5) {
+    trow(pp, "Battery", `${p.batt} V${p.batt < LOW_BATT_V ? " ⚠ low" : ""}`);
+  }
+  if (p.rssi !== undefined) {
+    trow(pp, "Signal", `${p.rssi} dBm · SNR ${p.snr} dB`);
+    if (p.sig && p.sig.length >= 2) {
+      trow(pp, "History", sparkline(p.sig), "Signal strength, last 20 packets");
+    }
+  }
+  trow(pp, "Last heard", fmtAge(now - p.ts));
+  if (p.trail.length) trow(pp, "Trail", `${p.trail.length + 1} points`);
 }
 
 // ---------- UI helpers ----------
@@ -397,7 +794,82 @@ function addSystem(text) {
   scrollLog(false);
 }
 
-function addMessage({ mine, from, text, rssi, snr, id, pos }) {
+// ---------- Chat history (survives reload) ----------
+const HISTORY_KEY = "lorachat.history", HISTORY_MAX = 200;
+let chatHistory = [];
+try { chatHistory = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); } catch (_) {}
+if (!Array.isArray(chatHistory)) chatHistory = [];
+let historyRendered = false;
+
+function saveHistory(entry) {
+  chatHistory.push(entry);
+  if (chatHistory.length > HISTORY_MAX) chatHistory = chatHistory.slice(-HISTORY_MAX);
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(chatHistory)); } catch (_) {}
+}
+
+function renderHistory() {
+  if (historyRendered) return;
+  historyRendered = true;
+  if (!chatHistory.length) return;
+  for (const h of chatHistory.slice(-HISTORY_MAX)) {
+    addMessage({ mine: h.mine, from: h.from, text: h.text, pos: h.pos,
+                 time: h.time, ts: h.ts, restore: true });
+  }
+  addSystem("— earlier session ↑ —");
+}
+
+let lastMsgEpoch = 0;   // for >1 h time dividers in the log
+const DELIVERY_TIPS = {
+  "⏳": "Waiting for the board to transmit",
+  "✓ sent": "Transmitted over the air — waiting for the recipient's confirmation",
+  "✓✓ delivered": "Delivered — the recipient's board confirmed receipt",
+};
+
+// Geo meta line: link to maps + coordinate copy (only when we have coords)
+function geoLine(pos) {
+  const where = describePeerPos(pos);
+  if (!where) return null;
+  const geo = document.createElement("div");
+  geo.className = "meta";
+  if (pos.sats > 0 && pos.lat !== undefined) {
+    const coords = `${pos.lat.toFixed(7)},${pos.lon.toFixed(7)}`;
+    const a = document.createElement("a");
+    a.href = `https://www.google.com/maps?q=${coords}`;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.title = `Open ${coords} in Google Maps`;
+    a.textContent = where;
+    geo.appendChild(a);
+    const copy = document.createElement("span");
+    copy.className = "copybtn";
+    copy.textContent = "⧉";
+    copy.title = "Copy coordinates";
+    copy.addEventListener("click", () => {
+      navigator.clipboard && navigator.clipboard.writeText(coords);
+      copy.textContent = "✓";
+      setTimeout(() => { copy.textContent = "⧉"; }, 1200);
+    });
+    geo.appendChild(copy);
+  } else {
+    geo.textContent = where;
+  }
+  return geo;
+}
+
+function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore }) {
+  const when = time || timeNow();
+  const msgTs = restore ? ts : Date.now();
+  if (msgTs) {
+    // time divider when >1 h passed since the previous message
+    if (lastMsgEpoch && msgTs - lastMsgEpoch > 3600000) {
+      const div = document.createElement("div");
+      div.className = "sys";
+      div.textContent = new Date(msgTs).toLocaleString([],
+        { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      els.log.appendChild(div);
+    }
+    lastMsgEpoch = msgTs;
+  }
   const wrap = document.createElement("div");
   wrap.className = "msg " + (mine ? "me" : "them");
 
@@ -405,6 +877,8 @@ function addMessage({ mine, from, text, rssi, snr, id, pos }) {
     const who = document.createElement("div");
     who.className = "who";
     who.textContent = from;
+    who.title = "Show in telemetry";
+    who.addEventListener("click", () => focusPeer(from));
     wrap.appendChild(who);
   }
 
@@ -415,30 +889,70 @@ function addMessage({ mine, from, text, rssi, snr, id, pos }) {
 
   const meta = document.createElement("div");
   meta.className = "meta";
-  let parts = [timeNow()];
+  let parts = [when];
   if (!mine && rssi !== undefined) parts.push(`${rssi} dBm · SNR ${snr}`);
-  if (mine) parts.push("⏳");
+  if (mine && !restore) { parts.push("⏳"); meta.title = DELIVERY_TIPS["⏳"]; }
   meta.textContent = parts.join("  ·  ");
   wrap.appendChild(meta);
 
-  if (!mine) {
-    const where = describePeerPos(pos);
-    if (where) {
-      const geo = document.createElement("div");
-      geo.className = "meta";
-      geo.textContent = where;
-      wrap.appendChild(geo);
-    }
+  if (!mine && pos) {
+    const geo = geoLine(pos);
+    if (geo) wrap.appendChild(geo);
   }
 
   els.log.appendChild(wrap);
-  if (mine && id !== undefined) bubblesById.set(id, { meta, time: timeNow() });
+  if (mine && !restore && id !== undefined) {
+    bubblesById.set(id, { meta, time: when, text, done: false });
+    meta.addEventListener("click", () => retrySend(id, meta));
+  }
+  if (!restore) saveHistory({ mine, from, text, time: when, ts: msgTs, pos });
   scrollLog(mine);
 }
 
-function setDelivery(id, mark) {
+function setDelivery(id, mark, done) {
   const b = bubblesById.get(id);
-  if (b) b.meta.textContent = `${b.time}  ·  ${mark}`;
+  if (!b) return;
+  b.meta.textContent = `${b.time}  ·  ${mark}`;
+  b.meta.title = DELIVERY_TIPS[mark] || "";
+  b.meta.classList.remove("retry");
+  if (done) {
+    b.done = true;
+    clearAckTimer(id);
+  }
+}
+
+// ---------- Delivery failure + retry ----------
+function clearAckTimer(id) {
+  const t = ackTimers.get(id);
+  if (t) { clearTimeout(t); ackTimers.delete(id); }
+}
+
+function armAckTimer(id) {
+  clearAckTimer(id);
+  ackTimers.set(id, setTimeout(() => {
+    ackTimers.delete(id);
+    const b = bubblesById.get(id);
+    if (!b || b.done) return;
+    b.meta.textContent = `${b.time}  ·  ✗ not delivered — click to retry`;
+    b.meta.title = "No delivery confirmation arrived — click to resend";
+    b.meta.classList.add("retry");
+  }, ACK_FAIL_MS));
+}
+
+function retrySend(oldId, meta) {
+  const b = bubblesById.get(oldId);
+  if (!b || b.done || !meta.classList.contains("retry") || !connected) return;
+  bubblesById.delete(oldId);
+  clearAckTimer(oldId);
+  const id = ++webMsgId;
+  b.time = timeNow();
+  bubblesById.set(id, b);
+  meta.classList.remove("retry");
+  meta.textContent = `${b.time}  ·  ⏳`;
+  meta.title = DELIVERY_TIPS["⏳"];
+  meta.addEventListener("click", () => retrySend(id, meta), { once: false });
+  writeLine({ t: "tx", id, text: b.text });
+  armAckTimer(id);
 }
 
 // ---------- Serial plumbing ----------
@@ -462,17 +976,29 @@ function handleBoardEvent(m) {
       break;
     case "rx":
       addMessage({ mine: false, from: m.from, text: m.text, rssi: m.rssi, snr: m.snr, pos: m.pos });
-      notePeer(m.from, m.pos);
+      notePeer(m.from, m.pos, m.rssi, m.snr);
+      updateLink(m.rssi, m.snr);
+      notifyIncoming();
       break;
     case "join": {
       let line = `${m.from} joined the chat  (${m.rssi} dBm)`;
       const where = describePeerPos(m.pos);
       if (where) line += `  ·  ${where}`;
       addSystem(line);
-      notePeer(m.from, m.pos);
+      notePeer(m.from, m.pos, m.rssi, m.snr);
+      updateLink(m.rssi, m.snr);
       break;
     }
+    case "beacon":   // periodic position broadcast — silent, feeds radar/roster/telemetry
+      notePeer(m.from, m.pos, m.rssi, m.snr, m.ext);
+      updateLink(m.rssi, m.snr);
+      break;
     case "gps":
+      myGps = m;
+      if (m.batt > 0.5) {
+        battHist.push({ t: Date.now(), v: +m.batt });
+        while (battHist.length && Date.now() - battHist[0].t > BATT_HIST_MS) battHist.shift();
+      }
       if (m.fix) {
         myPos = { lat: m.lat, lon: m.lon, alt: m.alt };
         els.gpspill.textContent = `GPS ${m.sats} sats`;
@@ -482,10 +1008,19 @@ function handleBoardEvent(m) {
         els.gpspill.textContent = "GPS no fix";
         els.gpspill.title = `Searching for satellites… · battery ${m.batt} V`;
       }
+      if (m.batt > 0.5 && m.batt < LOW_BATT_V) {
+        els.gpspill.classList.add("lowbatt");
+        els.gpspill.textContent += " · 🔋⚠";
+        els.gpspill.title += ` · LOW BATTERY ${m.batt} V`;
+      } else {
+        els.gpspill.classList.remove("lowbatt");
+      }
       if (radarOn) drawRadar();
+      drawRoster();   // distances depend on our own position
+      renderTelemetry();
       break;
-    case "sent": setDelivery(m.id, "✓ sent"); break;
-    case "ack":  setDelivery(m.id, "✓✓ delivered"); break;
+    case "sent": setDelivery(m.id, "✓ sent"); armAckTimer(m.id); break;
+    case "ack":  setDelivery(m.id, "✓✓ delivered", true); break;
     case "err":  addSystem(`Board: ${m.msg}`); break;
   }
 }
@@ -566,8 +1101,11 @@ async function connectFlow(interactive) {
 
 function showChat() {
   els.hero.style.display = "none";
-  els.chat.style.display = "flex";
+  els.chat.style.display = "grid";
   els.radarBtn.style.display = "inline-block";
+  els.soundBtn.style.display = "inline-block";
+  applySoundBtn();
+  renderHistory();
   applyRadarVisibility();
   els.text.focus();
 }
@@ -579,6 +1117,7 @@ function sendCurrent() {
   const id = ++webMsgId;
   addMessage({ mine: true, text, id });
   writeLine({ t: "tx", id, text });
+  armAckTimer(id);   // re-armed on "sent"; fires if the board never answers
   els.text.value = "";
   updateCount();
 }
@@ -606,7 +1145,12 @@ els.radarBtn.addEventListener("click", () => {
   localStorage.setItem("lorachat.radar", radarOn ? "1" : "0");
   applyRadarVisibility();
 });
-setInterval(() => { if (radarOn && connected) drawRadar(); }, 10000); // age labels
+setInterval(() => {
+  if (!connected) return;
+  if (radarOn) drawRadar();
+  drawRoster();
+  renderTelemetry();
+}, 10000); // age labels + stale fading + last-heard refresh
 
 if (!("serial" in navigator)) {
   els.connectCard.style.display = "none";

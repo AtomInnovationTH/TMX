@@ -11,6 +11,11 @@
 //   board -> browser : {"t":"ready","fw":"1.0","freq":923.2,"name":"Joi"}
 //                      {"t":"rx","from":"Mai","text":"hi","rssi":-42,"snr":12.5}
 //                      {"t":"join","from":"Mai","rssi":-42,"snr":12.5}
+//                      {"t":"beacon","from":"Mai","rssi":-42,"snr":12.5,
+//                       "pos":{...},"ext":{"speed":4,"course":120,"hacc":4,"fixType":3}}
+//                      {"t":"gps",...,"speed":4.2,"course":118,"fixType":3,
+//                       "hacc":3.8,"pdop":1.6,"utc":"2026-06-13T06:40:12Z",
+//                       "up":120,"noise":-104.5,"tx":3,"rx":2}
 //                      {"t":"sent","id":7}        radio TX completed
 //                      {"t":"ack","id":7}         remote board confirmed receipt
 //                      {"t":"err","msg":"..."}
@@ -18,14 +23,18 @@
 // Air frame (binary, explicit header + CRC, max ~217 bytes):
 //   [0]   0xC4  magic
 //   [1]   0x01  protocol version
-//   [2]   type: 0=chat 1=join 2=ack    (bit7 set = 12-byte position trailer)
+//   [2]   type: 0=chat 1=join 2=ack 3=beacon (bit7 set = 12-byte position trailer)
 //   [3:4] senderId (random per power-on, little-endian)
 //   [5:6] msgId (little-endian)
 //   [7]   nameLen (<=16)
 //   [8..] name bytes, then payload:
-//           chat: UTF-8 text (<=180 bytes)
-//           join: empty
-//           ack : [origSenderId:2][origMsgId:2]
+//           chat  : UTF-8 text (<=180 bytes)
+//           join  : empty
+//           ack   : [origSenderId:2][origMsgId:2]
+//           beacon: [speed:u8 km/h capped][course:u8 deg/2][hacc:u8 m capped]
+//                   [fixType:u8]  (fw 1.3+; v1.2 parses the trailer from the
+//                   frame end and ignores these bytes; no ack; sent ~60 s when
+//                   fix held; unknown to fw <=1.1, which ignores type 3)
 //   trailer (when type bit7 set, appended after payload):
 //           [lat:i32 deg*1e7][lon:i32 deg*1e7][alt:i16 m][sats:u8][batt:u8 V*20]
 //
@@ -66,7 +75,7 @@ static const uint16_t LORA_PREAMBLE  = 8;
 // ---------- Protocol ----------
 static const uint8_t PROTO_MAGIC   = 0xC4;
 static const uint8_t PROTO_VERSION = 0x01;
-enum MsgType : uint8_t { TYPE_CHAT = 0, TYPE_JOIN = 1, TYPE_ACK = 2 };
+enum MsgType : uint8_t { TYPE_CHAT = 0, TYPE_JOIN = 1, TYPE_ACK = 2, TYPE_BEACON = 3 };
 static const uint8_t TYPE_MASK     = 0x7F;
 static const uint8_t FLAG_HAS_POS  = 0x80;   // bit7 of type byte
 
@@ -82,6 +91,7 @@ static const uint8_t  CAD_ATTEMPTS   = 5;     // listen-before-talk tries
 
 static const uint32_t GPS_POLL_MS    = 2000;  // read GPS/battery every 2 s
 static const uint32_t GPS_REPORT_MS  = 5000;  // own-position event to browser
+static const uint32_t BEACON_MS      = 60000; // position beacon period (+ jitter)
 
 // ---------- State ----------
 volatile bool receivedFlag    = false;
@@ -117,12 +127,24 @@ char lastFrom[MAX_NAME + 1] = "";
 char lastText[22] = "";          // truncated for OLED
 float lastRSSI = 0, lastSNR = 0;
 
-// Own position / battery (cached by pollGps)
+// Own position / battery / motion (cached by pollGps — single getPVT poll)
 int32_t  myLat = 0, myLon = 0;   // degrees * 1e7
 int16_t  myAltM = 0;             // meters MSL
 uint8_t  mySats = 0;             // 0 = no fix
 uint8_t  myBatt = 0;             // volts * 20
+int32_t  mySpeedMms = 0;         // ground speed, mm/s
+uint16_t myCourseDeg = 0;        // course over ground, degrees
+uint8_t  myFixType = 0;          // 0=none 2=2D 3=3D
+uint32_t myHaccMm = 0;           // horizontal accuracy estimate, mm
+uint16_t myPdop = 0;             // pDOP * 100
+uint16_t myYear = 0;             // UTC date/time (valid when myTimeOk)
+uint8_t  myMonth = 0, myDay = 0, myHour = 0, myMin = 0, mySec = 0;
+bool     myTimeOk = false;
 uint32_t lastGpsPoll = 0, lastGpsReport = 0;
+
+// Position beacon: starts after the browser joins; jittered so boards desync
+bool     hasJoined = false;
+uint32_t nextBeaconAt = 0;
 
 float readBattVolts() {
   const float R1 = 560000.0f, R2 = 100000.0f;
@@ -136,29 +158,62 @@ float readBattVolts() {
 void pollGps() {
   myBatt = (uint8_t)(readBattVolts() * 20.0f);
   if (!gpsOK) return;
-  if (myGPS.getPVT(100) && myGPS.getFixType() != 0 && myGPS.getSIV() > 3) {
+  if (!myGPS.getPVT(100)) {
+    mySats = 0;       // stale fix -> mark invalid, keep last lat/lon for OLED
+    myFixType = 0;
+    return;
+  }
+  // One PVT poll; every getter below reads the cached message (no extra I2C)
+  myFixType   = myGPS.getFixType();
+  uint8_t siv = myGPS.getSIV();
+  mySpeedMms  = myGPS.getGroundSpeed();             // mm/s
+  long crs    = myGPS.getHeading() / 100000L;       // deg*1e-5 -> deg
+  myCourseDeg = (uint16_t)(((crs % 360) + 360) % 360);
+  myHaccMm    = (uint32_t)myGPS.getHorizontalAccEst();
+  myPdop      = myGPS.getPDOP();                    // *0.01
+  myTimeOk    = myGPS.getDateValid() && myGPS.getTimeValid();
+  if (myTimeOk) {
+    myYear = myGPS.getYear();  myMonth = myGPS.getMonth(); myDay = myGPS.getDay();
+    myHour = myGPS.getHour();  myMin = myGPS.getMinute();  mySec = myGPS.getSecond();
+  }
+  if (myFixType != 0 && siv > 3) {
     myLat  = myGPS.getLatitude();
     myLon  = myGPS.getLongitude();
     long altMM = myGPS.getAltitudeMSL();
     myAltM = (int16_t)constrain(altMM / 1000, -32768L, 32767L);
-    mySats = myGPS.getSIV();
+    mySats = siv;
   } else {
-    mySats = 0;   // stale fix -> mark invalid, keep last lat/lon for OLED
+    mySats = 0;
   }
 }
 
-// Own-position event for the browser (it computes distance/bearing locally)
+// Own-position + board telemetry event for the browser
 void emitGps() {
-  StaticJsonDocument<224> d;
+  StaticJsonDocument<512> d;
   d["t"] = "gps";
   d["fix"] = (mySats > 0);
   d["sats"] = mySats;
+  d["fixType"] = myFixType;
   if (mySats > 0) {
     d["lat"] = serialized(String(myLat / 1e7, 7));
     d["lon"] = serialized(String(myLon / 1e7, 7));
     d["alt"] = myAltM;
+    d["speed"]  = serialized(String(mySpeedMms * 0.0036f, 1));   // mm/s -> km/h
+    d["course"] = myCourseDeg;
+    d["hacc"]   = serialized(String(myHaccMm / 1000.0f, 1));     // mm -> m
+    d["pdop"]   = serialized(String(myPdop * 0.01f, 1));
+  }
+  if (myTimeOk) {
+    char utc[24];
+    snprintf(utc, sizeof(utc), "%04u-%02u-%02uT%02u:%02u:%02uZ",
+             myYear, myMonth, myDay, myHour, myMin, mySec);
+    d["utc"] = utc;
   }
   d["batt"] = serialized(String(myBatt / 20.0f, 2));
+  d["up"] = millis() / 1000;
+  d["noise"] = serialized(String(lora.getRSSIInst(), 1));   // idle-RX noise floor
+  d["tx"] = txCount;
+  d["rx"] = rxCount;
   serializeJson(d, SerialUSB);
   SerialUSB.println();
 }
@@ -184,7 +239,7 @@ void onDio1(void) {
 void emitReady() {
   StaticJsonDocument<160> d;
   d["t"] = "ready";
-  d["fw"] = "1.1";
+  d["fw"] = "1.3";
   d["freq"] = LORA_FREQ;
   d["name"] = myName;
   serializeJson(d, SerialUSB);
@@ -413,6 +468,31 @@ void handleRadioPacket() {
     strncpy(lastText, "(joined)", sizeof(lastText) - 1);
     lastRSSI = rssi; lastSNR = snr;
     refreshDisplay();
+
+  } else if (type == TYPE_BEACON) {
+    if (duplicate || !hasPos) return;
+    StaticJsonDocument<384> d;
+    d["t"] = "beacon";
+    d["from"] = from;
+    d["rssi"] = serialized(String(rssi, 1));
+    d["snr"]  = serialized(String(snr, 1));
+    JsonObject pos = d.createNestedObject("pos");
+    pos["sats"] = pSats;
+    if (pSats > 0) {
+      pos["lat"] = serialized(String(pLat / 1e7, 7));
+      pos["lon"] = serialized(String(pLon / 1e7, 7));
+      pos["alt"] = pAlt;
+    }
+    pos["batt"] = serialized(String(pBatt / 20.0f, 2));
+    if (payloadLen >= 4) {            // fw 1.3+ extended beacon payload
+      JsonObject ext = d.createNestedObject("ext");
+      ext["speed"]   = payload[0];          // km/h
+      ext["course"]  = payload[1] * 2;      // deg
+      ext["hacc"]    = payload[2];          // m
+      ext["fixType"] = payload[3];
+    }
+    serializeJson(d, SerialUSB);
+    SerialUSB.println();
   }
 }
 
@@ -440,6 +520,8 @@ void handleLine(const char* line) {
     size_t len = buildFrame(frame, TYPE_JOIN, ++txMsgId, nullptr, 0, true);
     int16_t state = transmitFrame(frame, len);
     if (state != ERR_NONE) emitErr("radio tx failed");
+    hasJoined = true;                               // start periodic beacons
+    nextBeaconAt = millis() + BEACON_MS + random(0, 8000);
     refreshDisplay();
 
   } else if (strcmp(t, "tx") == 0) {
@@ -586,5 +668,23 @@ void loop() {
     lastGpsReport = now;
     emitGps();
     refreshDisplay();
+  }
+
+  // Periodic position beacon: only when joined, with a fix, and nothing
+  // awaiting an ack (don't trample a chat retransmit window). transmitFrame
+  // does CAD listen-before-talk; jitter keeps two boards from synchronizing.
+  if (hasJoined && mySats > 0 && !pendingActive && now >= nextBeaconAt) {
+    nextBeaconAt = now + BEACON_MS + random(0, 8000);
+    long kmh = mySpeedMms > 0 ? (mySpeedMms * 9L) / 2500L : 0;   // mm/s -> km/h
+    uint32_t haccM = myHaccMm / 1000;
+    uint8_t ext[4] = {
+      (uint8_t)(kmh > 255 ? 255 : kmh),
+      (uint8_t)(myCourseDeg / 2),
+      (uint8_t)(haccM > 255 ? 255 : haccM),
+      myFixType
+    };
+    uint8_t frame[MAX_FRAME];
+    size_t len = buildFrame(frame, TYPE_BEACON, ++txMsgId, ext, sizeof(ext), true);
+    transmitFrame(frame, len);
   }
 }

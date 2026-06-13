@@ -1,15 +1,31 @@
 # LightTracker RX Board Recovery Guide
 
-## STATUS: RESOLVED (2026-06-12)
+## STATUS: RESOLVED (re-verified 2026-06-13)
 Both boards are working. SWD recovery was NOT needed — the RX board's bootloader
 turned out to be intact (it re-enumerated as Arduino M0, PID 0x804e).
 
 - **TX board** (USB serial `B5290C2C…1E3D`): TX firmware verified live —
   transmits 923.2 MHz / SF8 / BW125 / 16 dBm every 60 s.
-- **RX board** (USB serial `FCD0A6F3…0F3D`): flashed via USB with
-  `build/rx/lora-asset-tracker-rx.ino.hex` (84,192 bytes written + verified).
-- **End-to-end link verified**: RX receives every TX packet with matching
-  telemetry (trackerID 1234, GPS fix, RSSI -42 dBm, SNR 12.5 dB).
+- **RX board** (USB serial `FCD0A6F3…0F3D`): was found silent (no serial output
+  for 80 s while TX was active — wrong/halted firmware) and reflashed via USB on
+  2026-06-13 with `build/rx/lora-asset-tracker-rx.ino.hex`
+  (84,192 bytes written + verified by avrdude).
+- **End-to-end link verified (2026-06-13)**: RX prints full
+  "Incoming Packet Telemetry" (trackerID 1234, GPS fix lat 18.78/long 98.95,
+  RSSI -41.00 dBm, SNR 12.25 dB, 923.20 MHz / SF8 / BW125) for the packet TX
+  sent during a 95 s dual-port capture.
+
+### Diagnosis tips (learned the hard way)
+- USB PID tells the mode: **0x004d = bootloader, 0x804e = sketch running**.
+  Enumeration at 0x804e does NOT prove the sketch is healthy — both sketches
+  halt forever pre-setup if pin A1 reads LOW at boot, and the SAMD core brings
+  up USB before `setup()`.
+- TX firmware only prints once per 60 s cycle (DEVMODE is commented out), so
+  serial captures must span **≥80 s** before concluding a TX board is dead.
+  RX firmware prints on every received packet, so RX silence while TX is
+  active IS diagnostic.
+- Ports renumber after resets/replugs — re-verify port↔board mapping via
+  `system_profiler SPUSBDataType` serial numbers immediately before any upload.
 
 ### Toolchain fix that made USB upload work on Apple Silicon
 The bundled avrdude at
