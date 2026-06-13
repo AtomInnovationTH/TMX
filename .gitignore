@@ -35,6 +35,10 @@
 # Local agent/session files
 .kilo/
 
+# Local-only handoff notes — never publish to GitHub
+HANDOFF.md
+handoff.md
+
 # Build intermediates (prebuilt .hex files ARE committed for easy flashing)
 build/**/*.elf
 build/**/*.map
