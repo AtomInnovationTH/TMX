@@ -97,7 +97,7 @@
   /* Chat screen — two-column desktop layout */
   #chat {
     flex: 1; display: none; min-height: 0;
-    grid-template-columns: minmax(0, 1fr) 340px;
+    grid-template-columns: minmax(0, 1fr) 360px;
   }
   #left { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   #right {
@@ -109,6 +109,9 @@
     display: flex; flex-direction: column; gap: 8px;
     scroll-behavior: smooth;
   }
+  /* Anchor the conversation to the bottom (rises from the composer) until it
+     overflows, then scrolls normally — standard chat feel, no empty gap. */
+  #log > :first-child { margin-top: auto; }
   @media (prefers-reduced-motion: reduce) { #log { scroll-behavior: auto; } }
 
   .msg { max-width: 72%; display: flex; flex-direction: column; }
@@ -182,6 +185,7 @@
     border-radius: var(--radius); padding: 10px 14px; flex: 0 0 auto;
   }
   #radarcard { text-align: center; }
+  #radarSvg { width: 100%; height: auto; max-width: 340px; display: block; margin: 0 auto; }
   #radarcard .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
   #telemetry h3 {
     margin: 6px 0 4px; font-size: 11px; font-weight: 600;
@@ -196,6 +200,19 @@
   .trow .tv { text-align: right; overflow-wrap: anywhere; min-width: 0; }
   .tv.click { cursor: pointer; }
   .tempty { color: var(--muted); font-size: 13px; padding: 2px 0; }
+
+  /* Telemetry headline: the one fact you check first, given visual weight */
+  .theadline {
+    font-size: 17px; font-weight: 600; line-height: 1.25; margin: 2px 0 8px;
+  }
+  .theadline .sub { font-size: 12px; font-weight: 400; color: var(--muted); }
+  .theadline.good { color: var(--ok); }
+  .theadline.bad  { color: var(--bad); }
+  .theadline.warn { color: #d97706; }
+  /* Value highlighting for prioritized rows */
+  .tv.good { color: var(--ok); }
+  .tv.bad  { color: var(--bad); }
+  .tv.warn { color: #d97706; }
 
   @media (max-width: 900px) {
     /* Fallback: right column stacks above the chat, like the v1.2 layout */
@@ -251,7 +268,7 @@
   </div>
   <div id="right">
     <div id="radarcard">
-      <svg id="radarSvg" width="300" height="300" role="img" aria-label="Range and direction radar"></svg>
+      <svg id="radarSvg" viewBox="0 0 300 300" width="300" height="300" role="img" aria-label="Range and direction radar"></svg>
       <div class="meta" id="radarMsg"></div>
     </div>
     <div id="telemetry">
@@ -344,12 +361,15 @@ els.soundBtn.addEventListener("click", () => {
 });
 
 // ---------- Link quality (last received RSSI) ----------
-function updateLink(rssi, snr) {
-  if (rssi === undefined) return;
+function rssiBars(rssi) {
   const r = +rssi;
   const lvl = r > -70 ? 4 : r > -90 ? 3 : r > -105 ? 2 : 1;
+  return "▂▄▆█".slice(0, lvl);
+}
+function updateLink(rssi, snr) {
+  if (rssi === undefined) return;
   els.linkpill.style.display = "inline-flex";
-  els.linkpill.textContent = "▂▄▆█".slice(0, lvl);
+  els.linkpill.textContent = rssiBars(rssi);
   els.linkpill.title = `Last received signal: ${rssi} dBm · SNR ${snr} dB`;
 }
 
@@ -378,8 +398,9 @@ function fmtDistance(m) {
   if (m < 1000) return `${Math.round(m)} m`;
   return `${(m / 1000).toFixed(m < 10000 ? 2 : 1)} km`;
 }
-// Human line for a peer position relative to us; null if nothing to say
-function describePeerPos(pos) {
+// Human line for a peer position relative to us; null if nothing to say.
+// `batt:false` omits the battery (continuous state the telemetry panel owns).
+function describePeerPos(pos, { batt = true } = {}) {
   if (!pos) return null;
   const parts = [];
   if (pos.sats > 0) {
@@ -396,7 +417,7 @@ function describePeerPos(pos) {
       parts.push(`📍 ${pos.lat.toFixed(5)}, ${pos.lon.toFixed(5)}`);
     }
   }
-  if (pos.batt > 0.5) parts.push(`🔋 ${pos.batt} V${pos.batt < LOW_BATT_V ? " ⚠" : ""}`);
+  if (batt && pos.batt > 0.5) parts.push(`🔋 ${pos.batt} V${pos.batt < LOW_BATT_V ? " ⚠" : ""}`);
   return parts.length ? parts.join("  ·  ") : null;
 }
 
@@ -410,6 +431,7 @@ const SVGNS = "http://www.w3.org/2000/svg";
 const PEER_TTL_MS = 15 * 60000;   // drop peers not heard from in 15 min
 const TRAIL_MAX = 20;             // breadcrumb points kept per peer
 const SIG_MAX = 20;               // RSSI sparkline points kept per peer
+const DIST_MAX = 12;              // distance samples kept per peer (range trend)
 
 function notePeer(from, pos, rssi, snr, ext) {
   const p = peers.get(from) || { trail: [], sig: [] };
@@ -431,6 +453,11 @@ function notePeer(from, pos, rssi, snr, ext) {
         if (p.trail.length > TRAIL_MAX) p.trail.shift();
       }
       p.lat = pos.lat; p.lon = pos.lon; p.alt = pos.alt;
+      if (myPos) {
+        if (!p.dist) p.dist = [];
+        p.dist.push({ t: p.ts, d: haversineM(myPos, { lat: p.lat, lon: p.lon }) });
+        if (p.dist.length > DIST_MAX) p.dist.shift();
+      }
     }
   }
   peers.set(from, p);
@@ -630,6 +657,58 @@ function fmtUptime(s) {
   return h ? `${h} h ${m} min` : m ? `${m} min` : `${s} s`;
 }
 
+// Range trend for a peer: are we closing on them or opening up? Derived from
+// the recent distance samples — the key question when you're tracking someone.
+function rangeTrend(p) {
+  if (!p.dist || p.dist.length < 2) return null;
+  const a = p.dist[0], b = p.dist[p.dist.length - 1];
+  const dt = (b.t - a.t) / 1000;
+  if (dt < 20) return null;
+  const ms = (b.d - a.d) / dt;          // + opening, − closing
+  if (Math.abs(ms) < 0.12) return { word: "holding range", cls: "" };
+  const kmh = (Math.abs(ms) * 3.6).toFixed(1);
+  return ms < 0
+    ? { word: `closing · ${kmh} km/h ↓`, cls: "good" }
+    : { word: `opening · ${kmh} km/h ↑`, cls: "warn" };
+}
+
+// Extrapolate time-to-low from the 10-min battery history slope.
+function battRuntime() {
+  if (battHist.length < 2) return null;
+  const a = battHist[0], b = battHist[battHist.length - 1];
+  const dt = (b.t - a.t) / 1000;
+  if (dt < 180) return null;            // need a few minutes of trend
+  const slope = (b.v - a.v) / dt;       // V/s
+  if (slope >= -2e-6) return null;      // flat or charging
+  const secs = (b.v - LOW_BATT_V) / -slope;
+  return secs > 0 && secs < 86400 ? secs : null;  // hide nonsense > 24 h
+}
+
+// Link quality word from SNR — turns a raw dB number into a glanceable margin.
+function signalWord(snr) {
+  if (snr === undefined) return null;
+  const s = +snr;
+  return s >= 5  ? { word: "strong", cls: "good" }
+       : s >= 0  ? { word: "good",   cls: "good" }
+       : s >= -7 ? { word: "ok",     cls: "" }
+                 : { word: "weak",   cls: "bad" };
+}
+
+// Prominent headline line at the top of a telemetry panel.
+function theadline(parent, main, sub, cls) {
+  const h = document.createElement("div");
+  h.className = "theadline" + (cls ? " " + cls : "");
+  h.textContent = main;
+  if (sub) {
+    const s = document.createElement("span");
+    s.className = "sub";
+    s.textContent = "  " + sub;
+    h.appendChild(s);
+  }
+  parent.appendChild(h);
+  return h;
+}
+
 // label/value row; returns the value element for extra wiring
 function trow(parent, label, value, title) {
   const row = document.createElement("div");
@@ -680,11 +759,14 @@ function renderTelemetry() {
   if (!m) {
     tempty(mine, "Waiting for board data…");
   } else {
-    let fixStr = FIX_NAMES[m.fixType] ?? `fix ${m.fixType}`;
-    if (m.fix) fixStr += ` · ${m.sats} sats`;
-    if (m.hacc !== undefined) fixStr += ` · ±${m.hacc} m`;
-    trow(mine, "Fix", fixStr,
-         m.pdop !== undefined ? `pDOP ${m.pdop} (lower = better geometry)` : "");
+    // Headline: is my fix good? That's the first thing you check.
+    if (m.fix) {
+      theadline(mine, `${FIX_NAMES[m.fixType] ?? "fix"} · ${m.sats} sats`,
+                m.hacc !== undefined ? `±${m.hacc} m` : "", "good");
+    } else {
+      theadline(mine, "No GPS fix",
+                m.sats !== undefined ? `${m.sats} sats in view` : "searching…", "bad");
+    }
     if (m.fix) {
       const coords = `${(+m.lat).toFixed(7)},${(+m.lon).toFixed(7)}`;
       const v = trow(mine, "Position",
@@ -699,21 +781,32 @@ function renderTelemetry() {
           ? `${m.speed} km/h ${fmtBearing(m.course)}`
           : `${m.speed} km/h`);
       }
+      if (m.pdop !== undefined) {
+        trow(mine, "Geometry", `pDOP ${m.pdop}`,
+             "Lower pDOP = better satellite geometry");
+      }
     }
     if (m.utc) trow(mine, "UTC", m.utc.replace("T", " ").replace("Z", ""),
                     "Satellite-synced clock from the board");
     if (m.batt > 0.5) {
-      trow(mine, "Battery",
-           `${m.batt} V${battTrendArrow()}${m.batt < LOW_BATT_V ? " ⚠ low" : ""}`,
-           "Trend arrow: charging/draining over the last 10 min");
+      const low = m.batt < LOW_BATT_V;
+      const secs = battRuntime();
+      let txt = `${m.batt} V${battTrendArrow()}`;
+      if (secs) txt += ` · ~${fmtUptime(Math.round(secs))} to low`;
+      else if (low) txt += " · low";
+      const v = trow(mine, "Battery", txt,
+           "Trend arrow + runtime estimated from the last 10 min");
+      if (low) v.classList.add("bad");
+      else if (secs) v.classList.add("warn");
     }
     if (m.up !== undefined) trow(mine, "Uptime", fmtUptime(m.up));
     if (m.tx !== undefined) trow(mine, "Packets", `${m.tx} tx · ${m.rx} rx`);
     if (m.noise !== undefined) {
       const n = +m.noise;
-      trow(mine, "Channel",
+      const v = trow(mine, "Channel",
            `${m.noise} dBm · ${n < -100 ? "quiet" : n < -85 ? "some traffic" : "busy"}`,
            "Noise floor while idle — lower is a quieter channel");
+      if (n >= -85) v.classList.add("warn");
     }
   }
 
@@ -728,12 +821,24 @@ function renderTelemetry() {
   }
   const p = peers.get(name);
   const now = Date.now();
+  const stale = now - p.ts > 120000;
+
+  // Headline: where they are relative to us is the whole point of the panel.
   if (p.lat !== undefined && myPos) {
-    trow(pp, "Distance",
-         `${fmtDistance(haversineM(myPos, p))} ${fmtBearing(bearingDeg(myPos, p))}`);
+    theadline(pp, `${fmtDistance(haversineM(myPos, p))} ${fmtBearing(bearingDeg(myPos, p))}`,
+              fmtAge(now - p.ts), stale ? "warn" : "");
+    const tr = rangeTrend(p);
+    if (tr) {
+      const v = trow(pp, "Range trend", tr.word);
+      if (tr.cls) v.classList.add(tr.cls);
+    }
   } else if (p.lat !== undefined) {
-    trow(pp, "Position", `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`);
+    theadline(pp, `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`,
+              "no local fix to compare", "");
+  } else {
+    theadline(pp, "No position yet", fmtAge(now - p.ts), "warn");
   }
+
   if (p.ext) {
     trow(pp, "Moving", p.ext.speed > 2
       ? `${fmtBearing(p.ext.course)} at ${p.ext.speed} km/h`
@@ -746,15 +851,18 @@ function renderTelemetry() {
     if (Math.abs(dAlt) >= 10) trow(pp, "Alt delta", `${dAlt > 0 ? "+" : ""}${dAlt} m`);
   }
   if (p.batt > 0.5) {
-    trow(pp, "Battery", `${p.batt} V${p.batt < LOW_BATT_V ? " ⚠ low" : ""}`);
+    const v = trow(pp, "Battery", `${p.batt} V${p.batt < LOW_BATT_V ? " · low" : ""}`);
+    if (p.batt < LOW_BATT_V) v.classList.add("bad");
   }
   if (p.rssi !== undefined) {
-    trow(pp, "Signal", `${p.rssi} dBm · SNR ${p.snr} dB`);
+    const sw = signalWord(p.snr);
+    const v = trow(pp, "Signal",
+         `${p.rssi} dBm · SNR ${p.snr} dB${sw ? " · " + sw.word : ""}`);
+    if (sw && sw.cls) v.classList.add(sw.cls);
     if (p.sig && p.sig.length >= 2) {
       trow(pp, "History", sparkline(p.sig), "Signal strength, last 20 packets");
     }
   }
-  trow(pp, "Last heard", fmtAge(now - p.ts));
   if (p.trail.length) trow(pp, "Trail", `${p.trail.length + 1} points`);
 }
 
@@ -825,9 +933,10 @@ const DELIVERY_TIPS = {
   "✓✓ delivered": "Delivered — the recipient's board confirmed receipt",
 };
 
-// Geo meta line: link to maps + coordinate copy (only when we have coords)
+// Geo meta line: link to maps + coordinate copy (only when we have coords).
+// Battery is dropped here — it's continuous state the telemetry panel owns.
 function geoLine(pos) {
-  const where = describePeerPos(pos);
+  const where = describePeerPos(pos, { batt: false });
   if (!where) return null;
   const geo = document.createElement("div");
   geo.className = "meta";
@@ -889,10 +998,15 @@ function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore })
 
   const meta = document.createElement("div");
   meta.className = "meta";
-  let parts = [when];
-  if (!mine && rssi !== undefined) parts.push(`${rssi} dBm · SNR ${snr}`);
-  if (mine && !restore) { parts.push("⏳"); meta.title = DELIVERY_TIPS["⏳"]; }
-  meta.textContent = parts.join("  ·  ");
+  meta.textContent = when;
+  if (!mine && rssi !== undefined) {
+    // Compact strength glyph only — exact dBm/SNR live in the telemetry panel.
+    const sig = document.createElement("span");
+    sig.textContent = "  ·  " + rssiBars(rssi);
+    sig.title = `Signal when received: ${rssi} dBm · SNR ${snr} dB`;
+    meta.appendChild(sig);
+  }
+  if (mine && !restore) { meta.textContent = `${when}  ·  ⏳`; meta.title = DELIVERY_TIPS["⏳"]; }
   wrap.appendChild(meta);
 
   if (!mine && pos) {
