@@ -23,12 +23,17 @@
 // Air frame (binary, explicit header + CRC, max ~217 bytes):
 //   [0]   0xC4  magic
 //   [1]   0x01  protocol version
-//   [2]   type: 0=chat 1=join 2=ack 3=beacon (bit7 set = 12-byte position trailer)
+//   [2]   type: 0=chat 1=join 2=ack 3=beacon
+//         bit6 (0x40) set = chat payload is smaz-compressed (fw 1.4+)
+//         bit7 (0x80) set = 12-byte position trailer
 //   [3:4] senderId (random per power-on, little-endian)
 //   [5:6] msgId (little-endian)
 //   [7]   nameLen (<=16)
 //   [8..] name bytes, then payload:
-//           chat  : UTF-8 text (<=180 bytes)
+//           chat  : UTF-8 text (<=180 bytes), optionally smaz-compressed when
+//                   the bit6 flag is set (TX uses it only when it shrinks the
+//                   payload; RX decompresses before emitting plaintext). Thai/
+//                   emoji and other incompressible text fall back to raw.
 //           join  : empty
 //           ack   : [origSenderId:2][origMsgId:2]
 //           beacon: [speed:u8 km/h capped][course:u8 deg/2][hacc:u8 m capped]
@@ -46,6 +51,7 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include "SparkFun_Ublox_Arduino_Library.h"
+#include "smaz.h"
 
 // ---------- Hardware (LightTracker-B) ----------
 // SX1262: NSS 8, DIO1 3, NRST 9, BUSY 2
@@ -76,8 +82,9 @@ static const uint16_t LORA_PREAMBLE  = 8;
 static const uint8_t PROTO_MAGIC   = 0xC4;
 static const uint8_t PROTO_VERSION = 0x01;
 enum MsgType : uint8_t { TYPE_CHAT = 0, TYPE_JOIN = 1, TYPE_ACK = 2, TYPE_BEACON = 3 };
-static const uint8_t TYPE_MASK     = 0x7F;
-static const uint8_t FLAG_HAS_POS  = 0x80;   // bit7 of type byte
+static const uint8_t TYPE_MASK       = 0x3F;   // was 0x7F (types are 0..3)
+static const uint8_t FLAG_COMPRESSED = 0x40;   // bit6: chat payload is smaz-compressed
+static const uint8_t FLAG_HAS_POS    = 0x80;   // bit7 of type byte
 
 static const uint8_t  MAX_NAME    = 16;
 static const uint8_t  MAX_TEXT    = 180;
@@ -239,7 +246,7 @@ void onDio1(void) {
 void emitReady() {
   StaticJsonDocument<160> d;
   d["t"] = "ready";
-  d["fw"] = "1.3";
+  d["fw"] = "1.4";
   d["freq"] = LORA_FREQ;
   d["name"] = myName;
   serializeJson(d, SerialUSB);
@@ -320,11 +327,12 @@ int16_t transmitFrame(const uint8_t* frame, size_t len) {
 }
 
 size_t buildFrame(uint8_t* buf, uint8_t type, uint16_t msgId,
-                  const uint8_t* payload, size_t payloadLen, bool withPos) {
+                  const uint8_t* payload, size_t payloadLen, bool withPos,
+                  bool compressed) {
   uint8_t nameLen = strlen(myName);
   buf[0] = PROTO_MAGIC;
   buf[1] = PROTO_VERSION;
-  buf[2] = withPos ? (type | FLAG_HAS_POS) : type;
+  buf[2] = type | (withPos ? FLAG_HAS_POS : 0) | (compressed ? FLAG_COMPRESSED : 0);
   buf[3] = myId & 0xFF;
   buf[4] = myId >> 8;
   buf[5] = msgId & 0xFF;
@@ -345,7 +353,7 @@ void sendAck(uint16_t origSender, uint16_t origMsgId) {
     (uint8_t)(origMsgId & 0xFF), (uint8_t)(origMsgId >> 8)
   };
   uint8_t frame[MAX_FRAME];
-  size_t len = buildFrame(frame, TYPE_ACK, ++txMsgId, payload, sizeof(payload), false);
+  size_t len = buildFrame(frame, TYPE_ACK, ++txMsgId, payload, sizeof(payload), false, false);
   transmitFrame(frame, len);
 }
 
@@ -371,6 +379,7 @@ void handleRadioPacket() {
   uint8_t  rawType = buf[2];
   uint8_t  type    = rawType & TYPE_MASK;
   bool     hasPos  = (rawType & FLAG_HAS_POS) != 0;
+  bool     compressed = (rawType & FLAG_COMPRESSED) != 0;
   uint16_t sender  = buf[3] | (buf[4] << 8);
   uint16_t msgId   = buf[5] | (buf[6] << 8);
   uint8_t  nameLen = buf[7];
@@ -415,9 +424,15 @@ void handleRadioPacket() {
     if (duplicate) return;
 
     char text[MAX_TEXT + 1];
-    size_t tlen = payloadLen > MAX_TEXT ? MAX_TEXT : payloadLen;
-    memcpy(text, payload, tlen);
-    text[tlen] = '\0';
+    if (compressed) {
+      int dlen = smaz_decompress((const char*)payload, (int)payloadLen, text, MAX_TEXT);
+      if (dlen < 0 || dlen > MAX_TEXT) return;   // corrupt/oversized -> drop
+      text[dlen] = '\0';
+    } else {
+      size_t tlen = payloadLen > MAX_TEXT ? MAX_TEXT : payloadLen;
+      memcpy(text, payload, tlen);
+      text[tlen] = '\0';
+    }
 
     StaticJsonDocument<512> d;
     d["t"] = "rx";
@@ -517,7 +532,7 @@ void handleLine(const char* line) {
 
   } else if (strcmp(t, "join") == 0) {
     uint8_t frame[MAX_FRAME];
-    size_t len = buildFrame(frame, TYPE_JOIN, ++txMsgId, nullptr, 0, true);
+    size_t len = buildFrame(frame, TYPE_JOIN, ++txMsgId, nullptr, 0, true, false);
     int16_t state = transmitFrame(frame, len);
     if (state != ERR_NONE) emitErr("radio tx failed");
     hasJoined = true;                               // start periodic beacons
@@ -534,9 +549,23 @@ void handleLine(const char* line) {
       // Previous message still waiting on ack; give up on its ack
       pendingActive = false;
     }
+    // smaz the text; use the compressed form only when it's actually smaller,
+    // so the on-air payload is never larger than the raw text. Thai/emoji and
+    // other incompressible input fall back to raw. cbuf is oversized for smaz's
+    // worst case (it never bounds-checks the verbatim-escape writes).
+    uint8_t cbuf[MAX_TEXT * 2 + 16];
+    int clen = smaz_compress(text, (int)tlen, (char*)cbuf, sizeof(cbuf));
+    const uint8_t* payload;
+    size_t payloadLen;
+    bool compressed;
+    if (clen > 0 && clen < (int)tlen) {
+      payload = cbuf; payloadLen = (size_t)clen; compressed = true;
+    } else {
+      payload = (const uint8_t*)text; payloadLen = tlen; compressed = false;
+    }
     uint8_t frame[MAX_FRAME];
     size_t len = buildFrame(frame, TYPE_CHAT, ++txMsgId,
-                            (const uint8_t*)text, tlen, true);
+                            payload, payloadLen, true, compressed);
     int16_t state = transmitFrame(frame, len);
     if (state == ERR_NONE) {
       emitStatus("sent", webId);
@@ -684,7 +713,7 @@ void loop() {
       myFixType
     };
     uint8_t frame[MAX_FRAME];
-    size_t len = buildFrame(frame, TYPE_BEACON, ++txMsgId, ext, sizeof(ext), true);
+    size_t len = buildFrame(frame, TYPE_BEACON, ++txMsgId, ext, sizeof(ext), true, false);
     transmitFrame(frame, len);
   }
 }
