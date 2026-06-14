@@ -6,16 +6,18 @@
 // Serial protocol (newline-delimited JSON):
 //   browser -> board : {"t":"ping"}
 //                      {"t":"name","v":"Joi"}
+//                      {"t":"client","v":"Chrome 126 · macOS · desktop"}
 //                      {"t":"join"}
 //                      {"t":"tx","id":7,"text":"hello"}
-//   board -> browser : {"t":"ready","fw":"1.0","freq":923.2,"name":"Joi"}
+//   board -> browser : {"t":"ready","fw":"1.5","freq":923.2,"name":"Joi"}
 //                      {"t":"rx","from":"Mai","text":"hi","rssi":-42,"snr":12.5}
-//                      {"t":"join","from":"Mai","rssi":-42,"snr":12.5}
+//                      {"t":"join","from":"Mai","rssi":-42,"snr":12.5,
+//                       "client":"Edge · Windows · desktop"}
 //                      {"t":"beacon","from":"Mai","rssi":-42,"snr":12.5,
 //                       "pos":{...},"ext":{"speed":4,"course":120,"hacc":4,"fixType":3}}
 //                      {"t":"gps",...,"speed":4.2,"course":118,"fixType":3,
 //                       "hacc":3.8,"pdop":1.6,"utc":"2026-06-13T06:40:12Z",
-//                       "up":120,"noise":-104.5,"tx":3,"rx":2}
+//                       "up":120,"noise":-104.5,"tx":3,"rx":2,"csave":47}
 //                      {"t":"sent","id":7}        radio TX completed
 //                      {"t":"ack","id":7}         remote board confirmed receipt
 //                      {"t":"err","msg":"..."}
@@ -34,7 +36,9 @@
 //                   the bit6 flag is set (TX uses it only when it shrinks the
 //                   payload; RX decompresses before emitting plaintext). Thai/
 //                   emoji and other incompressible text fall back to raw.
-//           join  : empty
+//           join  : compact client/app profile string (fw 1.5+, <=40 bytes),
+//                   smaz-compressed when bit6 set; empty when none. Older boards
+//                   (<=1.4) ignore these extra bytes (they only read the trailer).
 //           ack   : [origSenderId:2][origMsgId:2]
 //           beacon: [speed:u8 km/h capped][course:u8 deg/2][hacc:u8 m capped]
 //                   [fixType:u8]  (fw 1.3+; v1.2 parses the trailer from the
@@ -107,6 +111,11 @@ volatile bool enableInterrupt = true;
 uint16_t myId = 0;          // random per power-on
 uint16_t txMsgId = 0;       // increments per outgoing frame
 char     myName[MAX_NAME + 1] = "anon";
+// Compact client/app profile (browser+OS+kind or app/fw version) sent once in the
+// JOIN payload so peers can show "what the other side is chatting from". Local
+// until the browser provides it; never anything more sensitive than this string.
+static const uint8_t MAX_CLIENT = 40;
+char     myClient[MAX_CLIENT + 1] = "";
 
 // Pending-ack tracking (one in flight; chat is human-speed)
 bool     pendingActive = false;
@@ -130,6 +139,7 @@ bool   lineOverflow = false;
 
 // Counters / OLED status
 uint32_t rxCount = 0, txCount = 0;
+uint32_t bytesRaw = 0, bytesAir = 0;   // chat-text bytes before/after smaz (csave %)
 char lastFrom[MAX_NAME + 1] = "";
 char lastText[22] = "";          // truncated for OLED
 float lastRSSI = 0, lastSNR = 0;
@@ -221,6 +231,7 @@ void emitGps() {
   d["noise"] = serialized(String(lora.getRSSIInst(), 1));   // idle-RX noise floor
   d["tx"] = txCount;
   d["rx"] = rxCount;
+  if (bytesRaw > 0) d["csave"] = (uint8_t)((bytesRaw - bytesAir) * 100 / bytesRaw);
   serializeJson(d, SerialUSB);
   SerialUSB.println();
 }
@@ -246,7 +257,7 @@ void onDio1(void) {
 void emitReady() {
   StaticJsonDocument<160> d;
   d["t"] = "ready";
-  d["fw"] = "1.4";
+  d["fw"] = "1.5";
   d["freq"] = LORA_FREQ;
   d["name"] = myName;
   serializeJson(d, SerialUSB);
@@ -466,6 +477,18 @@ void handleRadioPacket() {
     d["from"] = from;
     d["rssi"] = serialized(String(rssi, 1));
     d["snr"]  = serialized(String(snr, 1));
+    // Optional client/app profile carried in the JOIN payload (fw 1.5+).
+    char client[MAX_CLIENT + 1];
+    if (payloadLen > 0) {
+      if (compressed) {
+        int dl = smaz_decompress((const char*)payload, (int)payloadLen, client, MAX_CLIENT);
+        if (dl > 0 && dl <= MAX_CLIENT) { client[dl] = '\0'; d["client"] = client; }
+      } else {
+        size_t cl = payloadLen > MAX_CLIENT ? MAX_CLIENT : payloadLen;
+        memcpy(client, payload, cl); client[cl] = '\0';
+        d["client"] = client;
+      }
+    }
     if (hasPos) {
       JsonObject pos = d.createNestedObject("pos");
       pos["sats"] = pSats;
@@ -530,9 +553,27 @@ void handleLine(const char* line) {
     emitReady();
     refreshDisplay();
 
+  } else if (strcmp(t, "client") == 0) {
+    const char* v = d["v"];
+    if (!v) { emitErr("missing client"); return; }
+    strncpy(myClient, v, MAX_CLIENT);
+    myClient[MAX_CLIENT] = '\0';
+    // stored; transmitted as the JOIN payload on the next join
+
   } else if (strcmp(t, "join") == 0) {
+    // Carry the compact client profile as the JOIN payload (smaz when smaller,
+    // so on-air size never exceeds raw; empty when the browser hasn't sent one).
     uint8_t frame[MAX_FRAME];
-    size_t len = buildFrame(frame, TYPE_JOIN, ++txMsgId, nullptr, 0, true, false);
+    size_t clen = strlen(myClient);
+    bool comp = false;
+    const uint8_t* pl = (const uint8_t*)myClient;
+    size_t plLen = clen;
+    uint8_t cbuf[MAX_CLIENT * 2 + 16];
+    if (clen) {
+      int z = smaz_compress(myClient, (int)clen, (char*)cbuf, sizeof(cbuf));
+      if (z > 0 && z < (int)clen) { pl = cbuf; plLen = (size_t)z; comp = true; }
+    }
+    size_t len = buildFrame(frame, TYPE_JOIN, ++txMsgId, pl, plLen, true, comp);
     int16_t state = transmitFrame(frame, len);
     if (state != ERR_NONE) emitErr("radio tx failed");
     hasJoined = true;                               // start periodic beacons
@@ -563,6 +604,8 @@ void handleLine(const char* line) {
     } else {
       payload = (const uint8_t*)text; payloadLen = tlen; compressed = false;
     }
+    bytesRaw += tlen;          // running totals -> csave % on the gps event
+    bytesAir += payloadLen;
     uint8_t frame[MAX_FRAME];
     size_t len = buildFrame(frame, TYPE_CHAT, ++txMsgId,
                             payload, payloadLen, true, compressed);

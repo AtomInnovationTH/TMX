@@ -53,7 +53,9 @@ Browser ⇄ Web Serial (USB) ⇄ LightTracker ⇄ 923.2 MHz LoRa ⇄ LightTracke
   filtering, per-boot random sender IDs, duplicate suppression,
   listen-before-talk (CAD + random backoff), and ACK + one retransmit.
   Chat and join frames carry a 12-byte position trailer (GPS lat/lon/alt,
-  satellite count, battery); the header GPS pill shows your own fix status.
+  satellite count, battery); the header GPS pill shows your own fix status. The
+  join frame also carries a tiny client/app profile (browser · OS · desktop) so
+  each side can see what the other is chatting from.
 - `docs/index.html` — the whole app in a single file. Vanilla JS, zero
   dependencies, zero external requests, works offline once loaded.
 

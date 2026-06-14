@@ -79,6 +79,10 @@
     background: transparent; color: var(--accent);
     border: 1px solid var(--border);
   }
+  button.ghost.icon {
+    padding: 6px 9px; font-size: 15px; line-height: 1; color: var(--text);
+  }
+  button.ghost.icon.active { color: var(--accent); border-color: var(--accent); }
 
   /* Hero / connect screen */
   #hero {
@@ -102,10 +106,10 @@
   .card input:focus { outline: 2px solid var(--accent); border-color: transparent; }
   #unsupported { display: none; }
 
-  /* Chat screen — two-column desktop layout */
+  /* Chat screen — two-column desktop layout: chat ~40%, tracker ~60% */
   #chat {
     flex: 1; display: none; min-height: 0;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
   }
   #left { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   #resetBtn { padding: 4px 12px; font-size: 13px; }
@@ -225,10 +229,10 @@
   /* Right column: radar + telemetry */
   #radarcard, #telemetry {
     background: var(--card); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 10px 14px; flex: 0 0 auto;
+    border-radius: var(--radius); padding: 8px 10px; flex: 0 0 auto;
   }
   #radarcard { text-align: center; }
-  #radarSvg { width: 100%; height: auto; max-width: 440px; display: block; margin: 0 auto; }
+  #radarSvg { width: 100%; height: auto; max-width: 560px; display: block; margin: 0 auto; }
   #radarcard .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
   #telemetry h3 {
     margin: 6px 0 4px; font-size: 11px; font-weight: 600;
@@ -242,6 +246,13 @@
   .trow .tl { color: var(--muted); flex: 0 0 auto; }
   .trow .tv { text-align: right; overflow-wrap: anywhere; min-width: 0; }
   .tv.click { cursor: pointer; }
+  .tsub {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .5px; color: var(--muted); opacity: .7;
+    margin: 8px 0 2px;
+  }
+  .tgaugewrap { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
+  .tgaugeval { font-size: 13px; }
 
   /* Telemetry headline: a friendly summary line with a CONSTANT style. State is
      conveyed by the small status dot, not by recoloring/resizing this line. */
@@ -293,14 +304,14 @@
 <div id="chat">
   <div id="left">
     <header>
-      <h1>LoRaChat v1.4 <small id="subtitle">923.2 MHz</small></h1>
+      <h1>LoRaChat <small id="subtitle">923.2 MHz</small></h1>
       <span class="pill" id="gpspill" title="Your LightTracker's GPS">GPS —</span>
       <span class="pill" id="linkpill" title="Signal strength of the last received message">▂</span>
       <span class="pill"><span class="dot" id="dot"></span><span id="status">Disconnected</span></span>
-      <button class="ghost" id="soundBtn" style="display:none" title="Message sound">🔔</button>
-      <button class="ghost" id="radarBtn" style="display:none">📡 Radar</button>
-      <button class="ghost" id="reconnect" style="display:none">Reconnect</button>
-      <button class="ghost" id="resetBtn" title="Clear chat history">Reset</button>
+      <button class="ghost icon" id="soundBtn" style="display:none" title="Message sound">🔔</button>
+      <button class="ghost icon" id="radarBtn" style="display:none" title="Show/hide the tracker panel">📡</button>
+      <button class="ghost icon" id="reconnect" style="display:none" title="Reconnect">↻</button>
+      <button class="ghost icon" id="resetBtn" title="Clear chat history">🗑</button>
     </header>
     <div id="roster"></div>
     <div id="log" aria-live="polite"></div>
@@ -318,11 +329,11 @@
       <div class="meta" id="radarMsg"></div>
     </div>
     <div id="telemetry">
-      <h3>My board</h3>
-      <div id="telemMine"></div>
       <h3 id="telemPeerName">Peer</h3>
       <div id="telemPeer"></div>
-      <h3>This browser</h3>
+      <h3>My board</h3>
+      <div id="telemMine"></div>
+      <h3>This device</h3>
       <div id="telemBrowser"></div>
     </div>
   </div>
@@ -496,7 +507,7 @@ function describePeerPos(pos, { batt = true } = {}) {
 }
 
 // ---------- Peers (roster + radar + telemetry) ----------
-// name -> {lat?, lon?, alt?, batt?, sats, rssi?, snr?, ts,
+// name -> {lat?, lon?, alt?, batt?, sats, rssi?, snr?, ts, client?,
 //          trail:[{lat,lon}], ext?:{speed,course,hacc,fixType}}
 const peers = new Map();
 let focusedPeer = null;           // telemetry panel focus (click roster/radar)
@@ -505,11 +516,12 @@ const SVGNS = "http://www.w3.org/2000/svg";
 const PEER_TTL_MS = 15 * 60000;   // drop peers not heard from in 15 min
 const TRAIL_MAX = 20;             // breadcrumb points kept per peer
 
-function notePeer(from, pos, rssi, snr, ext) {
+function notePeer(from, pos, rssi, snr, ext, client) {
   const p = peers.get(from) || { trail: [] };
   p.ts = Date.now();
   if (rssi !== undefined) { p.rssi = rssi; p.snr = snr; }
   if (ext) p.ext = ext;
+  if (client) p.client = client;
   if (pos) {
     p.batt = pos.batt;
     p.sats = pos.sats;
@@ -605,17 +617,19 @@ function drawRadar() {
   if (!radarOn) return;
   const svg = els.radarSvg;
   svg.replaceChildren();
-  const W = 300, C = W / 2, R = C - 22;
+  const W = 300, C = W / 2, R = C - 12;
   const grid = "stroke:var(--border);fill:none";
   const label = "fill:var(--muted);font-size:10px";
 
   for (const f of [0.5, 1]) svg.appendChild(svgEl("circle", { cx: C, cy: C, r: R * f, style: grid }));
   svg.appendChild(svgEl("line", { x1: C, y1: C - R, x2: C, y2: C + R, style: grid }));
   svg.appendChild(svgEl("line", { x1: C - R, y1: C, x2: C + R, y2: C, style: grid }));
-  svg.appendChild(svgEl("text", { x: C, y: C - R - 6, "text-anchor": "middle", style: label }, "N"));
-  svg.appendChild(svgEl("text", { x: C + R + 7, y: C + 3, style: label }, "E"));
-  svg.appendChild(svgEl("text", { x: C, y: C + R + 14, "text-anchor": "middle", style: label }, "S"));
-  svg.appendChild(svgEl("text", { x: C - R - 16, y: C + 3, style: label }, "W"));
+  // Compass labels sit just inside the outer ring (no wasted margin around it).
+  const compass = "fill:var(--muted);font-size:11px;font-weight:600";
+  svg.appendChild(svgEl("text", { x: C, y: C - R + 11, "text-anchor": "middle", style: compass }, "N"));
+  svg.appendChild(svgEl("text", { x: C + R - 4, y: C + 4, "text-anchor": "end", style: compass }, "E"));
+  svg.appendChild(svgEl("text", { x: C, y: C + R - 3, "text-anchor": "middle", style: compass }, "S"));
+  svg.appendChild(svgEl("text", { x: C - R + 4, y: C + 4, "text-anchor": "start", style: compass }, "W"));
 
   // expire stale peers
   expirePeers();
@@ -634,9 +648,9 @@ function drawRadar() {
     }));
   const scale = niceScale(Math.max(100, ...plotted.map(x => x.d * 1.15)));
 
-  // ring distance labels
-  svg.appendChild(svgEl("text", { x: C + 4, y: C - R / 2 - 3, style: label }, fmtDistance(scale / 2)));
-  svg.appendChild(svgEl("text", { x: C + 4, y: C - R + 11, style: label }, fmtDistance(scale)));
+  // ring distance labels (offset right of the N axis so they clear the N label)
+  svg.appendChild(svgEl("text", { x: C + 5, y: C - R / 2 - 3, style: label }, fmtDistance(scale / 2)));
+  svg.appendChild(svgEl("text", { x: C + 5, y: C - R + 22, style: label }, fmtDistance(scale)));
 
   // me, at the center — dimmed when we're coasting on a lost fix
   svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5,
@@ -701,7 +715,8 @@ function drawRadar() {
 
 function applyRadarVisibility() {
   els.right.style.display = radarOn ? "" : "none";   // whole right column
-  els.radarBtn.textContent = radarOn ? "📡 Panel on" : "📡 Panel";
+  els.radarBtn.classList.toggle("active", radarOn);
+  els.radarBtn.title = radarOn ? "Hide the tracker panel" : "Show the tracker panel";
   if (radarOn) { drawRadar(); renderTelemetry(); }
 }
 
@@ -720,6 +735,28 @@ function battTrendArrow() {
 function fmtUptime(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h ? `${h} h ${m} min` : m ? `${m} min` : `${s} s`;
+}
+
+// Overall GPS fix quality from data the board already sends (no firmware change):
+// combines sats-in-fix, geometry (pDOP) and horizontal accuracy into a 0–5 level
+// + colour + short summary. The honest "satellite strength" read.
+function fixQuality(m) {
+  if (!m || !m.fix) return { level: 0, cls: "bad", text: "no fix" };
+  const sats = +m.sats || 0;
+  const pdop = m.pdop !== undefined ? +m.pdop : null;
+  // Score 0–5: pDOP is the dominant term, sat count and accuracy refine it.
+  let lvl;
+  if (pdop !== null) {
+    lvl = pdop < 1.5 ? 5 : pdop < 2 ? 4 : pdop < 3 ? 3 : pdop < 5 ? 2 : 1;
+  } else {
+    lvl = sats >= 9 ? 4 : sats >= 6 ? 3 : sats >= 4 ? 2 : 1;
+  }
+  if (sats < 5 && lvl > 2) lvl = 2;          // few sats caps the score
+  const cls = lvl >= 4 ? "good" : lvl >= 3 ? "warn" : "bad";
+  const bits = [`${sats} sats`];
+  if (pdop !== null) bits.push(`pDOP ${m.pdop}`);
+  if (m.hacc !== undefined) bits.push(`±${m.hacc} m`);
+  return { level: lvl, cls, text: bits.join(" · ") };
 }
 
 // Link quality word from SNR — turns a raw dB number into a glanceable margin.
@@ -768,6 +805,49 @@ function setHead(parts, cls, mainText, subText) {
   parts.sub.textContent = subText || "";
 }
 
+// Small group sub-heading inside a telemetry section (e.g. "Diagnostics").
+function thSub(parent, label) {
+  const s = document.createElement("div");
+  s.className = "tsub";
+  s.textContent = label;
+  parent.appendChild(s);
+}
+
+// A fix-quality row: a coloured 5-segment bar + a short value, built once.
+// Returns { setQuality(level0to5, cls, valueText) }.
+function thGauge(parent, label, title) {
+  const row = document.createElement("div");
+  row.className = "trow";
+  if (title) row.title = title;
+  const l = document.createElement("span");
+  l.className = "tl"; l.textContent = label;
+  const right = document.createElement("span");
+  right.className = "tv tgaugewrap";
+  const svg = svgEl("svg", { width: 56, height: 12, viewBox: "0 0 56 12",
+                             style: "display:inline-block;vertical-align:middle" });
+  const segs = [];
+  for (let i = 0; i < 5; i++) {
+    const r = svgEl("rect", { x: i * 11.2, y: 0, width: 9, height: 12, rx: 1.5,
+                              fill: "var(--border)" });
+    segs.push(r); svg.appendChild(r);
+  }
+  const val = document.createElement("span");
+  val.className = "tgaugeval"; val.textContent = DASH;
+  right.append(svg, val);
+  row.append(l, right);
+  parent.appendChild(row);
+  return {
+    set(level, cls, text) {
+      const color = cls === "good" ? "var(--ok)"
+                  : cls === "warn" ? "#d97706"
+                  : cls === "bad"  ? "var(--bad)" : "var(--text)";
+      for (let i = 0; i < 5; i++)
+        segs[i].setAttribute("fill", i < level ? color : "var(--border)");
+      val.textContent = text || DASH;
+    },
+  };
+}
+
 function buildTelemSkeleton() {
   if (telemBuilt) return;
   telemBuilt = true;
@@ -775,77 +855,51 @@ function buildTelemSkeleton() {
   const mine = els.telemMine;
   mine.replaceChildren();
   telemEls.mineHead = thHead(mine);
+  telemEls.mineQuality = thGauge(mine, "Fix quality",
+    "Overall GPS health from sats used, geometry (pDOP) and accuracy");
   telemEls.minePos = thRow(mine, "Position", "Click to copy coordinates");
   telemEls.minePos.addEventListener("click", () => {
     if (mineCoords && navigator.clipboard) navigator.clipboard.writeText(mineCoords);
   });
   telemEls.mineSpeed = thRow(mine, "Speed");
+  telemEls.mineBatt  = thRow(mine, "Battery", "Trend arrow: charging/draining over the last 10 min");
+  thSub(mine, "Diagnostics");
   telemEls.mineGeom  = thRow(mine, "Geometry", "Lower pDOP = better satellite geometry");
   telemEls.mineUtc   = thRow(mine, "UTC", "Satellite-synced clock from the board");
-  telemEls.mineBatt  = thRow(mine, "Battery", "Trend arrow: charging/draining over the last 10 min");
   telemEls.mineUp    = thRow(mine, "Uptime");
   telemEls.minePkts  = thRow(mine, "Packets");
+  telemEls.mineSave  = thRow(mine, "Compression", "Air-bytes saved by smaz text compression");
   telemEls.mineChan  = thRow(mine, "Channel", "Noise floor while idle — lower is a quieter channel");
 
   const pp = els.telemPeer;
   pp.replaceChildren();
   telemEls.peerHead = thHead(pp);
+  telemEls.peerSignal = thRow(pp, "Signal");
+  telemEls.peerBatt   = thRow(pp, "Battery");
   telemEls.peerMoving = thRow(pp, "Moving");
+  telemEls.peerClient = thRow(pp, "App", "What the peer is chatting from (sent once on join)");
+  thSub(pp, "Diagnostics");
   telemEls.peerFix    = thRow(pp, "Their fix");
   telemEls.peerAlt    = thRow(pp, "Alt delta");
-  telemEls.peerBatt   = thRow(pp, "Battery");
-  telemEls.peerSignal = thRow(pp, "Signal");
   telemEls.peerTrail  = thRow(pp, "Trail");
 
   const br = els.telemBrowser;
   br.replaceChildren();
   telemEls.brHead    = thHead(br);
-  telemEls.brDevice  = thRow(br, "Device");
-  telemEls.brCpu     = thRow(br, "CPU / RAM", "Logical cores · approx device memory");
-  telemEls.brGpu     = thRow(br, "GPU", "Unmasked WebGL renderer");
-  telemEls.brDisplay = thRow(br, "Display", "Screen · pixel ratio · colour depth");
   telemEls.brWindow  = thRow(br, "Window");
-  telemEls.brInput   = thRow(br, "Input");
   telemEls.brTheme   = thRow(br, "Theme");
-  telemEls.brLang    = thRow(br, "Languages");
-  telemEls.brTz      = thRow(br, "Time zone");
   telemEls.brClock   = thRow(br, "Local time");
-  telemEls.brNet     = thRow(br, "Network", "navigator.connection — coarse, Chromium only");
-  telemEls.brBatt    = thRow(br, "Battery");
-  telemEls.brStorage = thRow(br, "Storage", "Origin storage estimate (quota is approximate)");
-  telemEls.brMedia   = thRow(br, "Media in/out", "Counts only — labels need permission");
-  telemEls.brApis    = thRow(br, "Web APIs");
-  telemEls.brPrivacy = thRow(br, "Privacy");
   fillBrowserStatic();
 }
 
-// ---------- Client / browser info (local only — never sent over the air) ----------
+// ---------- Client / browser info (mostly local; a compact profile is sent
+// once over the air on join — see sendClientProfile) ----------
 let browserFilled = false;
 let lastInputTs = Date.now();
 ["pointermove", "pointerdown", "keydown", "wheel", "touchstart", "scroll"].forEach(ev =>
   window.addEventListener(ev, () => { lastInputTs = Date.now(); }, { passive: true }));
 ["resize", "online", "offline", "visibilitychange"].forEach(ev =>
   window.addEventListener(ev, () => { if (radarOn) renderBrowserDynamic(); }));
-
-function fmtBytes(n) {
-  if (n === undefined || n === null) return "?";
-  const u = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return `${n < 10 && i ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
-}
-
-function gpuRenderer() {
-  try {
-    const gl = document.createElement("canvas").getContext("webgl")
-            || document.createElement("canvas").getContext("experimental-webgl");
-    if (!gl) return "";
-    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
-    const r = (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
-                   : gl.getParameter(gl.RENDERER)) || "";
-    return r.toString().replace(/^ANGLE\s*\(/i, "").replace(/\)$/, "").trim();
-  } catch (_) { return ""; }
-}
 
 function uaFallback() {
   const ua = navigator.userAgent;
@@ -885,94 +939,43 @@ async function clientIdentity() {
   return { browser, os, osVer, arch, model };
 }
 
+// Compact client profile sent ONCE over the air on join so a peer can show what
+// you're chatting from. Deliberately minimal & low-sensitivity: browser + OS +
+// desktop/touch, capped to 40 chars (board MAX_CLIENT). No fingerprint data.
+const CLIENT_MAX = 40;
+function sendClientProfile() {
+  return clientIdentity().then(id => {
+    const kind = navigator.maxTouchPoints > 1 ? "touch" : "desktop";
+    const v = [id.browser, id.os, kind].filter(Boolean).join(" · ").slice(0, CLIENT_MAX);
+    writeLine({ t: "client", v });
+  }).catch(() => {});
+}
+
 function fillBrowserStatic() {
   if (browserFilled) return;
   browserFilled = true;
-  const set = (el, v) => { if (el) el.textContent = v || DASH; };
-
   clientIdentity().then(id => {
     const osLabel = (id.os || "") + (id.osVer ? " " + id.osVer : "");
-    setHead(telemEls.brHead, "good", id.browser || "This browser", osLabel);
-    const dev = [];
-    if (id.model) dev.push(id.model);
-    if (id.arch) dev.push(id.arch);
-    if (!dev.length) dev.push(navigator.maxTouchPoints > 1 ? "touch device" : "desktop");
-    set(telemEls.brDevice, dev.join(" · "));
+    const kind = navigator.maxTouchPoints > 1 ? "touch" : "desktop";
+    setHead(telemEls.brHead, "good", id.browser || "This browser",
+            [osLabel, kind].filter(Boolean).join(" · "));
   });
-
-  set(telemEls.brCpu,
-    `${navigator.hardwareConcurrency || "?"} cores` +
-    (navigator.deviceMemory ? ` · ${navigator.deviceMemory}+ GB` : ""));
-  set(telemEls.brGpu, gpuRenderer());
-  set(telemEls.brDisplay,
-    `${screen.width}×${screen.height} · ${window.devicePixelRatio}× · ${screen.colorDepth}-bit`);
-  set(telemEls.brLang, (navigator.languages || [navigator.language]).join(", "));
-  const off = -new Date().getTimezoneOffset();
-  set(telemEls.brTz,
-    `${Intl.DateTimeFormat().resolvedOptions().timeZone || "?"} · GMT${off >= 0 ? "+" : ""}${off / 60}`);
-
-  const apis = [
-    ["Serial", "serial" in navigator], ["BT", "bluetooth" in navigator],
-    ["USB", "usb" in navigator], ["HID", "hid" in navigator],
-    ["Geo", "geolocation" in navigator], ["WebGPU", "gpu" in navigator],
-  ].filter(([, ok]) => ok).map(([n]) => n);
-  set(telemEls.brApis, apis.join(" · "));
-
-  const dnt = navigator.doNotTrack || window.doNotTrack;
-  set(telemEls.brPrivacy,
-    `cookies ${navigator.cookieEnabled ? "on" : "off"} · DNT ${dnt === "1" ? "on" : "off"}`);
-
-  if (navigator.storage && navigator.storage.estimate) {
-    navigator.storage.estimate()
-      .then(e => set(telemEls.brStorage, `${fmtBytes(e.usage)} / ${fmtBytes(e.quota)}`))
-      .catch(() => {});
-  }
-  if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-    navigator.mediaDevices.enumerateDevices().then(list => {
-      const n = k => list.filter(x => x.kind === k).length;
-      set(telemEls.brMedia, `${n("videoinput")} cam · ${n("audioinput")} mic · ${n("audiooutput")} out`);
-    }).catch(() => {});
-  }
-  if (navigator.getBattery) {
-    navigator.getBattery().then(bat => {
-      const upd = () => set(telemEls.brBatt,
-        `${Math.round(bat.level * 100)}%${bat.charging ? " · charging" : ""}`);
-      upd();
-      bat.addEventListener("levelchange", upd);
-      bat.addEventListener("chargingchange", upd);
-    }).catch(() => {});
-  }
 }
 
-// Live bits only: presence dot, window size, theme, clock, network.
+// Live bits only: presence dot, window size, theme, clock.
 function renderBrowserDynamic() {
   if (!telemEls.brHead) return;
   const idleSec = Math.round((Date.now() - lastInputTs) / 1000);
   const online = navigator.onLine, hidden = document.hidden;
   const active = online && !hidden && idleSec < 60;
-  const presence = !online ? "offline"
-    : hidden ? "tab hidden"
-    : idleSec < 60 ? "active"
-    : `idle ${idleSec < 600 ? idleSec + "s" : Math.round(idleSec / 60) + "m"}`;
+  // Only the dot colour reflects presence; the head sub keeps the static OS label.
   telemEls.brHead.dot.className = "tdot " + (!online ? "bad" : active ? "good" : "warn");
-  telemEls.brHead.sub.textContent = presence;
 
   telemEls.brWindow.textContent = `${window.innerWidth}×${window.innerHeight}`;
-  telemEls.brInput.textContent =
-    `${matchMedia("(pointer:fine)").matches ? "mouse" : "touch"}` +
-    (navigator.maxTouchPoints ? ` · ${navigator.maxTouchPoints} pts` : "") +
-    (matchMedia("(hover:hover)").matches ? " · hover" : "");
   telemEls.brTheme.textContent =
     `${matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"}` +
     (matchMedia("(prefers-reduced-motion: reduce)").matches ? " · reduced motion" : "");
   telemEls.brClock.textContent = new Date().toLocaleTimeString();
-
-  const c = navigator.connection;
-  telemEls.brNet.textContent = c
-    ? `${online ? "online" : "offline"} · ${c.effectiveType || "?"}`
-      + (c.downlink ? ` · ${c.downlink} Mbps` : "")
-      + (c.rtt ? ` · ${c.rtt} ms` : "") + (c.saveData ? " · saver" : "")
-    : (online ? "online" : "offline");
 }
 
 function renderTelemetry() {
@@ -995,6 +998,9 @@ function renderTelemetry() {
     setHead(telemEls.mineHead, "bad", "No GPS fix",
             m.sats !== undefined ? `${m.sats} sats in view` : "searching…");
   }
+
+  const q = fixQuality(m);
+  telemEls.mineQuality.set(q.level, q.cls, q.text);
 
   const showPos = m && m.fix ? { lat: +m.lat, lon: +m.lon, alt: m.alt } : myPos;
   if (showPos) {
@@ -1023,6 +1029,8 @@ function renderTelemetry() {
       : DASH;
   telemEls.mineUp.textContent = m && m.up !== undefined ? fmtUptime(m.up) : DASH;
   telemEls.minePkts.textContent = m && m.tx !== undefined ? `${m.tx} tx · ${m.rx} rx` : DASH;
+  telemEls.mineSave.textContent =
+    m && m.csave !== undefined ? `${m.csave}% saved on air` : DASH;
   if (m && m.noise !== undefined) {
     const n = +m.noise;
     telemEls.mineChan.textContent =
@@ -1037,7 +1045,7 @@ function renderTelemetry() {
 
   if (!name) {
     setHead(telemEls.peerHead, "", "No peers heard yet", "");
-    for (const k of ["peerMoving","peerFix","peerAlt","peerBatt","peerSignal","peerTrail"])
+    for (const k of ["peerMoving","peerFix","peerAlt","peerBatt","peerSignal","peerTrail","peerClient"])
       telemEls[k].textContent = DASH;
     return;
   }
@@ -1077,6 +1085,7 @@ function renderTelemetry() {
     telemEls.peerSignal.textContent = DASH;
   }
   telemEls.peerTrail.textContent = p.trail.length ? `${p.trail.length + 1} points` : DASH;
+  telemEls.peerClient.textContent = p.client || DASH;
 }
 
 // ---------- UI helpers ----------
@@ -1089,8 +1098,16 @@ function setStatus(on, label) {
   els.reconnect.style.display = on ? "none" : "inline-block";
 }
 
-function scrollLog() {
-  els.log.scrollTop = els.log.scrollHeight;
+// Stick to the bottom only when the user is already there (or we force it, e.g.
+// for our own outgoing message / first paint). Otherwise leave their scroll
+// position alone so an incoming message never yanks them off older history.
+const NEAR_BOTTOM_PX = 80;
+function isNearBottom() {
+  const el = els.log;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM_PX;
+}
+function scrollLog(force) {
+  if (force || isNearBottom()) els.log.scrollTop = els.log.scrollHeight;
 }
 
 function timeNow() {
@@ -1098,12 +1115,13 @@ function timeNow() {
 }
 
 function addSystem(text) {
+  const wasNearBottom = isNearBottom();
   const el = document.createElement("div");
   el.className = "sys";
   el.textContent = text;
   els.log.appendChild(el);
   lastSender = null;   // a system line breaks the current turn
-  scrollLog(false);
+  scrollLog(wasNearBottom);
 }
 
 // ---------- Chat history (survives reload) ----------
@@ -1216,6 +1234,7 @@ function geoLine(pos) {
 }
 
 function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore }) {
+  const wasNearBottom = isNearBottom();
   const when = time || timeNow();
   const msgTs = restore ? ts : Date.now();
   lastMsgEpoch = msgTs || lastMsgEpoch;
@@ -1300,7 +1319,9 @@ function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore })
 
   lastSender = sk;
   lastGroupTs = msgTs || lastGroupTs;
-  scrollLog(mine);
+  // Force-scroll for our own message or while restoring history; otherwise only
+  // follow along if the user was already at the bottom before this arrived.
+  scrollLog(mine || restore || wasNearBottom);
 }
 
 function setDelivery(id, key, done) {
@@ -1366,7 +1387,8 @@ function handleBoardEvent(m) {
         setStatus(true, "Connected");
         showChat();
         writeLine({ t: "name", v: myName });
-        writeLine({ t: "join" });
+        // Send the compact profile first, then join, so the JOIN frame carries it.
+        sendClientProfile().finally(() => writeLine({ t: "join" }));
         addSystem(`You joined as ${myName} — announcing on ${m.freq} MHz`);
       }
       break;
@@ -1381,7 +1403,7 @@ function handleBoardEvent(m) {
       const where = describePeerPos(m.pos);
       if (where) line += `  ·  ${where}`;
       addSystem(line);
-      notePeer(m.from, m.pos, m.rssi, m.snr);
+      notePeer(m.from, m.pos, m.rssi, m.snr, undefined, m.client);
       updateLink(m.rssi, m.snr);
       break;
     }
