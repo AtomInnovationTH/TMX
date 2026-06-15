@@ -735,6 +735,15 @@ void setup() {
   emitReady();
   emitGps();
   refreshDisplay();
+
+  // Standalone (labeled) board: no browser will ever send "join", so start
+  // beaconing autonomously. It announces its name + battery right away (so you
+  // can confirm it's solar-powered and alive) and adds position once it gets a
+  // GPS lock. A browser-driven board still waits for an explicit join.
+  if (nameLocked) {
+    hasJoined = true;
+    nextBeaconAt = millis() + 10000;   // first beacon ~10 s after boot
+  }
 }
 
 void loop() {
@@ -753,10 +762,12 @@ void loop() {
     refreshDisplay();
   }
 
-  // Periodic position beacon: only when joined, with a fix, and nothing
-  // awaiting an ack (don't trample a chat retransmit window). transmitFrame
-  // does CAD listen-before-talk; jitter keeps two boards from synchronizing.
-  if (hasJoined && mySats > 0 && !pendingActive && now >= nextBeaconAt) {
+  // Periodic position beacon. A browser-driven board beacons only with a fix; a
+  // standalone labeled board (nameLocked) also beacons WITHOUT a fix so its
+  // presence + battery are reported (position is added once it locks). Never
+  // while an ack is pending (don't trample a chat retransmit window).
+  // transmitFrame does CAD listen-before-talk; jitter desyncs two boards.
+  if (hasJoined && (mySats > 0 || nameLocked) && !pendingActive && now >= nextBeaconAt) {
     nextBeaconAt = now + BEACON_MS + random(0, 8000);
     long kmh = mySpeedMms > 0 ? (mySpeedMms * 9L) / 2500L : 0;   // mm/s -> km/h
     uint32_t haccM = myHaccMm / 1000;
