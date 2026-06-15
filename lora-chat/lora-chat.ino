@@ -43,7 +43,9 @@
 //           beacon: [speed:u8 km/h capped][course:u8 deg/2][hacc:u8 m capped]
 //                   [fixType:u8]  (fw 1.3+; v1.2 parses the trailer from the
 //                   frame end and ignores these bytes; no ack; sent ~60 s when
-//                   fix held; unknown to fw <=1.1, which ignores type 3)
+//                   fix held; unknown to fw <=1.1, which ignores type 3).
+//                   fw 1.5+ also sends ONE beacon on boot (every board) as a
+//                   presence/power ping, and labeled boards beacon autonomously.
 //   trailer (when type bit7 set, appended after payload):
 //           [lat:i32 deg*1e7][lon:i32 deg*1e7][alt:i16 m][sats:u8][batt:u8 V*20]
 //
@@ -672,6 +674,22 @@ void checkAckRetry() {
   }
 }
 
+// Broadcast one position beacon: name + battery + position (if a fix is held) +
+// motion ext. Used for the boot ping and the periodic beacon.
+void sendBeacon() {
+  long kmh = mySpeedMms > 0 ? (mySpeedMms * 9L) / 2500L : 0;   // mm/s -> km/h
+  uint32_t haccM = myHaccMm / 1000;
+  uint8_t ext[4] = {
+    (uint8_t)(kmh > 255 ? 255 : kmh),
+    (uint8_t)(myCourseDeg / 2),
+    (uint8_t)(haccM > 255 ? 255 : haccM),
+    myFixType
+  };
+  uint8_t frame[MAX_FRAME];
+  size_t len = buildFrame(frame, TYPE_BEACON, ++txMsgId, ext, sizeof(ext), true, false);
+  transmitFrame(frame, len);
+}
+
 // ---------- Setup / loop ----------
 void setup() {
   SerialUSB.begin(115200);
@@ -736,6 +754,12 @@ void setup() {
   emitGps();
   refreshDisplay();
 
+  // One-time presence ping on boot, for EVERY board (chat handset or tracker).
+  // Announces name + battery (+ position if already locked) so a listener can
+  // confirm the board powered up — e.g. a solar board booting on marginal power
+  // (repeated boot pings = it's brown-out rebooting). Best-effort, CAD-gated.
+  sendBeacon();
+
   // Standalone (labeled) board: no browser will ever send "join", so start
   // beaconing autonomously. It announces its name + battery right away (so you
   // can confirm it's solar-powered and alive) and adds position once it gets a
@@ -769,16 +793,6 @@ void loop() {
   // transmitFrame does CAD listen-before-talk; jitter desyncs two boards.
   if (hasJoined && (mySats > 0 || nameLocked) && !pendingActive && now >= nextBeaconAt) {
     nextBeaconAt = now + BEACON_MS + random(0, 8000);
-    long kmh = mySpeedMms > 0 ? (mySpeedMms * 9L) / 2500L : 0;   // mm/s -> km/h
-    uint32_t haccM = myHaccMm / 1000;
-    uint8_t ext[4] = {
-      (uint8_t)(kmh > 255 ? 255 : kmh),
-      (uint8_t)(myCourseDeg / 2),
-      (uint8_t)(haccM > 255 ? 255 : haccM),
-      myFixType
-    };
-    uint8_t frame[MAX_FRAME];
-    size_t len = buildFrame(frame, TYPE_BEACON, ++txMsgId, ext, sizeof(ext), true, false);
-    transmitFrame(frame, len);
+    sendBeacon();
   }
 }
