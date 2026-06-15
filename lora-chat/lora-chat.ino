@@ -110,7 +110,15 @@ volatile bool enableInterrupt = true;
 
 uint16_t myId = 0;          // random per power-on
 uint16_t txMsgId = 0;       // increments per outgoing frame
-char     myName[MAX_NAME + 1] = "anon";
+// Build-time board label. Defaults to "anon" (browser sets the chat name).
+// Build a labeled board with: --build-property build.extra_flags=-DDEVICE_NAME='"solar"'
+// A non-default DEVICE_NAME is treated as a fixed identity: the board always
+// broadcasts it and ignores browser name-overrides (see handleLine "name").
+#ifndef DEVICE_NAME
+#define DEVICE_NAME "anon"
+#endif
+char     myName[MAX_NAME + 1] = DEVICE_NAME;
+const bool nameLocked = (strcmp(DEVICE_NAME, "anon") != 0);
 // Compact client/app profile (browser+OS+kind or app/fw version) sent once in the
 // JOIN payload so peers can show "what the other side is chatting from". Local
 // until the browser provides it; never anything more sensitive than this string.
@@ -260,6 +268,7 @@ void emitReady() {
   d["fw"] = "1.5";
   d["freq"] = LORA_FREQ;
   d["name"] = myName;
+  if (nameLocked) d["locked"] = true;
   serializeJson(d, SerialUSB);
   SerialUSB.println();
 }
@@ -548,8 +557,10 @@ void handleLine(const char* line) {
   } else if (strcmp(t, "name") == 0) {
     const char* v = d["v"];
     if (!v || !v[0]) { emitErr("missing name"); return; }
-    strncpy(myName, v, MAX_NAME);
-    myName[MAX_NAME] = '\0';
+    if (!nameLocked) {            // a labeled board keeps its fixed identity
+      strncpy(myName, v, MAX_NAME);
+      myName[MAX_NAME] = '\0';
+    }
     emitReady();
     refreshDisplay();
 

@@ -1384,12 +1384,19 @@ function handleBoardEvent(m) {
   switch (m.t) {
     case "ready":
       if (!connected) {
+        // A labeled board (e.g. "solar") owns its name: adopt it and don't
+        // bother trying to override it.
+        if (m.locked && m.name) {
+          myName = m.name;
+          localStorage.setItem("lorachat.name", myName);
+        }
         setStatus(true, "Connected");
         showChat();
-        writeLine({ t: "name", v: myName });
+        if (!m.locked) writeLine({ t: "name", v: myName });
         // Send the compact profile first, then join, so the JOIN frame carries it.
         sendClientProfile().finally(() => writeLine({ t: "join" }));
-        addSystem(`You joined as ${myName} — announcing on ${m.freq} MHz`);
+        addSystem(`You joined as ${myName} — announcing on ${m.freq} MHz`
+                  + (m.locked ? " (board label)" : ""));
       }
       break;
     case "rx":
