@@ -98,6 +98,8 @@
   .card p  { color: var(--muted); margin: 0 0 20px; }
   .card .big { font-size: 17px; padding: 12px 28px; }
   .card .hint { font-size: 13px; margin-top: 18px; }
+  .card .preview { margin-top: 16px; font-size: 13px; color: var(--muted); }
+  #unsupported .preview { margin-top: 20px; }
   .card input {
     font: inherit; width: 100%; padding: 10px 12px; margin-bottom: 14px;
     border: 1px solid var(--border); border-radius: 10px;
@@ -292,12 +294,14 @@
     <button class="big" id="connectBtn">Connect LightTracker</button>
     <p class="hint">Your browser will ask which USB device to use —
        choose <b>Arduino M0</b>.</p>
+    <button class="ghost preview" id="previewBtn">Look around without a device</button>
   </div>
   <div class="card" id="unsupported">
     <h2>This browser can't talk to USB devices</h2>
     <p>LoRa Chat needs the Web Serial API, available in
        <b>Chrome</b>, <b>Edge</b> or <b>Opera</b> on a desktop or laptop.
        Open this page in one of those browsers and you're set.</p>
+    <button class="ghost preview" id="previewBtn2">Look around anyway</button>
   </div>
 </div>
 
@@ -351,6 +355,7 @@ const els = {
   hero: $("hero"), chat: $("chat"), log: $("log"),
   connectCard: $("connectCard"), unsupported: $("unsupported"),
   connectBtn: $("connectBtn"), nameInput: $("nameInput"),
+  previewBtn: $("previewBtn"), previewBtn2: $("previewBtn2"),
   dot: $("dot"), status: $("status"), reconnect: $("reconnect"),
   text: $("text"), send: $("send"), count: $("count"),
   subtitle: $("subtitle"), gpspill: $("gpspill"),
@@ -364,6 +369,7 @@ const els = {
 
 let port = null, reader = null, writer = null;
 let connected = false;
+let previewing = false;   // exploring the UI without a board attached
 let myName = localStorage.getItem("lorachat.name") || "";
 let webMsgId = 0;
 let myPos = null;   // {lat,lon,alt} — last good fix; kept through brief dropouts
@@ -474,8 +480,8 @@ function updateGpsPill() {
     els.gpspill.title = `No fix for a while — showing last known position (last fix ${fmtAge(Date.now() - lastFixTs)})`;
   } else {
     const siv = m && m.siv !== undefined ? m.siv : (m ? m.sats : undefined);
-    els.gpspill.textContent = siv ? `GPS acquiring · ${siv} sats` : "GPS acquiring";
-    els.gpspill.title = m ? `Searching for satellites… · battery ${m.batt} V` : "Searching for satellites…";
+    els.gpspill.textContent = !m ? "GPS —" : siv ? `GPS acquiring · ${siv} sats` : "GPS acquiring";
+    els.gpspill.title = m ? `Searching for satellites… · battery ${m.batt} V` : "No board connected";
   }
   if (low) { els.gpspill.textContent += " · 🔋⚠"; els.gpspill.title += ` · LOW BATTERY ${m.batt} V`; }
   els.gpspill.classList.toggle("lowbatt", !!low);
@@ -1522,6 +1528,8 @@ function handleBoardEvent(m) {
         }
         setStatus(true, "Connected");
         showChat();
+        previewing = false;
+        els.text.placeholder = "Message…";
         if (!m.locked) writeLine({ t: "name", v: myName });
         // Send the compact profile first, then join, so the JOIN frame carries it.
         sendClientProfile().finally(() => writeLine({ t: "join" }));
@@ -1653,6 +1661,26 @@ function showChat() {
   els.text.focus();
 }
 
+// Open the full UI without a board so curious newcomers aren't dead-ended at
+// the connect screen. The composer is disabled (there's no radio to send on)
+// but the radar, telemetry and the live "This device" panel are all explorable.
+function enterPreview() {
+  previewing = true;
+  myName = els.nameInput.value.trim().slice(0, 16) || myName || "anon";
+  localStorage.setItem("lorachat.name", myName);
+  const serialOk = ("serial" in navigator);
+  showChat();
+  setStatus(false, serialOk ? "Preview" : "Preview · no USB");
+  if (!serialOk) els.reconnect.style.display = "none";   // can't connect here
+  els.text.placeholder = serialOk
+    ? "Connect a LightTracker to send messages…"
+    : "Chatting needs Chrome, Edge or Opera + a LightTracker…";
+  addSystem("Preview mode — looking around without a LightTracker. "
+    + (serialOk ? "Plug one in and press ↻ to start chatting."
+                : "Chatting needs a LightTracker on Chrome, Edge or Opera."));
+  renderTelemetry();   // populate the live "This device" panel right away
+}
+
 // ---------- Composer ----------
 function sendCurrent() {
   const text = els.text.value.trim();
@@ -1677,6 +1705,8 @@ els.text.addEventListener("input", updateCount);
 
 // ---------- Entry ----------
 els.connectBtn.addEventListener("click", () => connectFlow(true));
+els.previewBtn.addEventListener("click", enterPreview);
+els.previewBtn2.addEventListener("click", enterPreview);
 els.nameInput.addEventListener("keydown", e => {
   if (e.key === "Enter") connectFlow(true);
 });
@@ -1689,7 +1719,7 @@ els.radarBtn.addEventListener("click", () => {
   applyRadarVisibility();
 });
 setInterval(() => {
-  if (!connected) return;
+  if (!connected && !previewing) return;
   updateGpsPill();   // keep the "GPS lost · age" counter fresh
   if (radarOn) drawRadar();
   drawRoster();
