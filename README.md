@@ -1,5 +1,7 @@
 # 💬 LoRa Chat — off-grid browser chat with two LightTrackers
 
+**Version:** firmware **v1.6** · 923.2 MHz (AS923 Thailand)
+
 **Open the chat app:** **https://atominnovationth.github.io/TMX/**
 *(enable Pages once: repo Settings → Pages → branch `main`, folder `/docs`)*
 
