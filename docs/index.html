@@ -764,6 +764,11 @@ function applyRadarVisibility() {
 // ---------- Telemetry panel ----------
 const FIX_NAMES = { 0: "no fix", 1: "dead reckoning", 2: "2D fix", 3: "3D fix",
                     4: "GNSS+DR", 5: "time only" };
+// User-friendly fix wording (FIX_NAMES has jargon like "GNSS+DR"/"time only").
+// fixLabel: what kind of fix; fixGrade: a one-word quality read.
+function fixLabel(t) { return t === 3 ? "3D fix" : t === 2 ? "2D fix" : t >= 1 ? "GPS fix" : "no fix"; }
+function fixGrade(t) { return t >= 3 ? "Good" : t === 2 ? "Rough" : t >= 1 ? "Poor" : "no fix"; }
+function cap(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
 
 function battTrendArrow() {
   if (battHist.length < 2) return "";
@@ -800,11 +805,15 @@ function fmtBatt(v, withTrend) {
   return `${v} V · ~${lipoPct(v)}%${trend}${v < LOW_BATT_V ? " · low" : ""}`;
 }
 
-// Overall GPS fix quality from data the board already sends (no firmware change):
-// combines sats-in-fix, geometry (pDOP) and horizontal accuracy into a 0–5 level
-// + colour + short summary. The honest "satellite strength" read.
+// "Sky view": a plain-language read on GPS quality from data the board already
+// sends (no firmware change) — combines sats-in-fix, satellite geometry (pDOP)
+// and horizontal accuracy into a 0–5 level + colour + a word a normal user
+// understands. pDOP measures how open/spread the visible sky is, which is the
+// one thing the user can fix by moving the board — so a low reading nudges them
+// to "open sky". The numeric sats · pDOP · ±m detail lives in the row tooltip.
+const SKY_WORDS = { 5: "Excellent", 4: "Good", 3: "Fair", 2: "Weak", 1: "Poor" };
 function fixQuality(m) {
-  if (!m || !m.fix) return { level: 0, cls: "bad", text: "no fix" };
+  if (!m || !m.fix) return { level: 0, cls: "bad", word: "no fix", tip: "No GPS fix yet" };
   const sats = +m.sats || 0;
   const pdop = m.pdop !== undefined ? +m.pdop : null;
   // Score 0–5: pDOP is the dominant term, sat count and accuracy refine it.
@@ -816,10 +825,15 @@ function fixQuality(m) {
   }
   if (sats < 5 && lvl > 2) lvl = 2;          // few sats caps the score
   const cls = lvl >= 4 ? "good" : lvl >= 3 ? "warn" : "bad";
+  // Nudge the user to act only when the geometry is mediocre or worse.
+  let word = SKY_WORDS[lvl] || "Poor";
+  if (lvl <= 3) word += " · move to open sky";
   const bits = [`${sats} sats`];
   if (pdop !== null) bits.push(`pDOP ${m.pdop}`);
   if (m.hacc !== undefined) bits.push(`±${m.hacc} m`);
-  return { level: lvl, cls, text: bits.join(" · ") };
+  const tip = "Sky view — how open/spread the visible sky is (satellite geometry). "
+            + bits.join(" · ");
+  return { level: lvl, cls, word, tip };
 }
 
 // Link quality word from SNR — turns a raw dB number into a glanceable margin.
@@ -900,13 +914,14 @@ function thGauge(parent, label, title) {
   row.append(l, right);
   parent.appendChild(row);
   return {
-    set(level, cls, text) {
+    set(level, cls, text, title) {
       const color = cls === "good" ? "var(--ok)"
                   : cls === "warn" ? "#d97706"
                   : cls === "bad"  ? "var(--bad)" : "var(--text)";
       for (let i = 0; i < 5; i++)
         segs[i].setAttribute("fill", i < level ? color : "var(--border)");
       val.textContent = text || DASH;
+      if (title !== undefined) row.title = title;
     },
   };
 }
@@ -918,17 +933,35 @@ function buildTelemSkeleton() {
   const mine = els.telemMine;
   mine.replaceChildren();
   telemEls.mineHead = thHead(mine);
-  telemEls.mineQuality = thGauge(mine, "Fix quality",
-    "Overall GPS health from sats used, geometry (pDOP) and accuracy");
+  telemEls.mineQuality = thGauge(mine, "Sky view",
+    "How open/spread the board's view of the sky is — drives GPS accuracy");
   telemEls.mineSats = thRow(mine, "Sats", "Satellites used in the fix / tracked in view");
-  telemEls.minePos = thRow(mine, "Position", "Click to copy coordinates");
-  telemEls.minePos.addEventListener("click", () => {
-    if (mineCoords && navigator.clipboard) navigator.clipboard.writeText(mineCoords);
+  telemEls.minePos = thRow(mine, "Position", "Tap to open in a map · ⧉ to copy");
+  // Coords as a map link (primary action) + a small copy glyph. Nodes are built
+  // once and only their text/href update, keeping the panel stable.
+  telemEls.minePosLink = document.createElement("a");
+  telemEls.minePosLink.target = "_blank";
+  telemEls.minePosLink.rel = "noopener";
+  telemEls.minePosLink.style.color = "var(--accent)";
+  telemEls.minePosLink.textContent = DASH;
+  telemEls.minePosCopy = document.createElement("span");
+  telemEls.minePosCopy.className = "copybtn";
+  telemEls.minePosCopy.textContent = " ⧉";
+  telemEls.minePosCopy.title = "Copy coordinates";
+  telemEls.minePosCopy.style.cursor = "pointer";
+  telemEls.minePosCopy.style.display = "none";
+  telemEls.minePosCopy.addEventListener("click", () => {
+    if (mineCoords && navigator.clipboard) {
+      navigator.clipboard.writeText(mineCoords);
+      telemEls.minePosCopy.textContent = " ✓";
+      setTimeout(() => { telemEls.minePosCopy.textContent = " ⧉"; }, 1200);
+    }
   });
+  telemEls.minePos.replaceChildren(telemEls.minePosLink, telemEls.minePosCopy);
   telemEls.mineSpeed = thRow(mine, "Speed");
   telemEls.mineBatt  = thRow(mine, "Battery", "Trend arrow: charging/draining over the last 10 min");
   thSub(mine, "Diagnostics");
-  telemEls.mineUtc   = thRow(mine, "UTC", "Satellite-synced clock from the board");
+  telemEls.mineUtc   = thRow(mine, "Satellite clock", "GPS-synced UTC time from the board");
   telemEls.mineUp    = thRow(mine, "Uptime");
   telemEls.minePkts  = thRow(mine, "Packets");
   telemEls.mineSave  = thRow(mine, "Compression", "Air-bytes saved by smaz text compression");
@@ -937,14 +970,16 @@ function buildTelemSkeleton() {
   const pp = els.telemPeer;
   pp.replaceChildren();
   telemEls.peerHead = thHead(pp);
-  telemEls.peerSignal = thRow(pp, "Signal");
+  // Battery first: for a remote tracker, "is it alive / charged" matters more
+  // than link quality.
   telemEls.peerBatt   = thRow(pp, "Battery");
+  telemEls.peerSignal = thRow(pp, "Signal", "Radio link quality of the last packet heard");
   telemEls.peerMoving = thRow(pp, "Moving");
   telemEls.peerClient = thRow(pp, "App", "What the peer is chatting from (sent once on join)");
   thSub(pp, "Diagnostics");
-  telemEls.peerFix    = thRow(pp, "Their fix");
-  telemEls.peerAlt    = thRow(pp, "Alt delta");
-  telemEls.peerTrail  = thRow(pp, "Trail");
+  telemEls.peerFix    = thRow(pp, "GPS", "The peer's own fix quality and accuracy");
+  telemEls.peerAlt    = thRow(pp, "Elevation", "Height relative to your board");
+  telemEls.peerTrail  = thRow(pp, "Path", "Recent breadcrumb positions on the radar");
 
   const br = els.telemBrowser;
   br.replaceChildren();
@@ -1054,7 +1089,7 @@ function renderTelemetry() {
   if (!m) {
     setHead(telemEls.mineHead, "", "Waiting for board…", "");
   } else if (state === "live") {
-    setHead(telemEls.mineHead, "good", `${FIX_NAMES[m.fixType] ?? "fix"} · ${m.sats} sats`,
+    setHead(telemEls.mineHead, "good", `${fixLabel(m.fixType)} · ${m.sats} sats`,
             m.hacc !== undefined ? `±${m.hacc} m` : "");
   } else if (state === "holding") {
     setHead(telemEls.mineHead, "warn", "Holding fix", `last fix ${fmtAge(now - lastFixTs)}`);
@@ -1065,9 +1100,17 @@ function renderTelemetry() {
     setHead(telemEls.mineHead, "bad", "Acquiring…",
             siv !== undefined ? `${siv} sats in view` : "searching…");
   }
+  // Low battery (on-battery, not USB) escalates the dot so a dying board is
+  // glanceable without reading the Battery row.
+  if (m && +m.batt > 0.5 && +m.batt <= 4.3 && +m.batt < LOW_BATT_V) {
+    const d = telemEls.mineHead.dot;
+    if (!d.classList.contains("bad")) d.className = "tdot warn";
+    const s = telemEls.mineHead.sub;
+    s.textContent += (s.textContent ? " · " : "") + "🔋 low";
+  }
 
   const q = fixQuality(m);
-  telemEls.mineQuality.set(q.level, q.cls, q.text);
+  telemEls.mineQuality.set(q.level, q.cls, q.word, q.tip);
 
   // Sats: used in fix / tracked in view (the honest "GPS strength" read).
   // Only the live fix has a meaningful "used" count; while holding/lost/acquiring
@@ -1083,14 +1126,16 @@ function renderTelemetry() {
   const showPos = m && m.fix ? { lat: +m.lat, lon: +m.lon, alt: m.alt } : myPos;
   if (showPos) {
     mineCoords = `${showPos.lat.toFixed(7)},${showPos.lon.toFixed(7)}`;
-    telemEls.minePos.textContent =
-      `${showPos.lat.toFixed(5)}, ${showPos.lon.toFixed(5)} · ${showPos.alt} m`
+    telemEls.minePosLink.textContent =
+      `${showPos.lat.toFixed(5)}, ${showPos.lon.toFixed(5)} · alt ${showPos.alt} m`
       + (fixLost ? " · last known" : "");
-    telemEls.minePos.classList.add("click");
+    telemEls.minePosLink.href = `https://www.google.com/maps?q=${mineCoords}`;
+    telemEls.minePosCopy.style.display = "";
   } else {
     mineCoords = null;
-    telemEls.minePos.textContent = DASH;
-    telemEls.minePos.classList.remove("click");
+    telemEls.minePosLink.textContent = DASH;
+    telemEls.minePosLink.removeAttribute("href");
+    telemEls.minePosCopy.style.display = "none";
   }
 
   telemEls.mineSpeed.textContent =
@@ -1101,7 +1146,7 @@ function renderTelemetry() {
     m && m.utc ? m.utc.replace("T", " ").replace("Z", "") : DASH;
   telemEls.mineBatt.textContent = m ? fmtBatt(+m.batt, true) : DASH;
   telemEls.mineUp.textContent = m && m.up !== undefined ? fmtUptime(m.up) : DASH;
-  telemEls.minePkts.textContent = m && m.tx !== undefined ? `${m.tx} tx · ${m.rx} rx` : DASH;
+  telemEls.minePkts.textContent = m && m.tx !== undefined ? `${m.tx} sent · ${m.rx} received` : DASH;
   telemEls.mineSave.textContent =
     m && m.csave !== undefined ? `${m.csave}% saved on air` : DASH;
   if (m && m.noise !== undefined) {
@@ -1135,28 +1180,41 @@ function renderTelemetry() {
   } else {
     setHead(telemEls.peerHead, "warn", "No position yet", fmtAge(now - p.ts));
   }
+  // Low battery on a remote tracker is critical — escalate the dot + note it.
+  if (+p.batt > 0.5 && +p.batt <= 4.3 && +p.batt < LOW_BATT_V) {
+    telemEls.peerHead.dot.className = "tdot bad";
+    const s = telemEls.peerHead.sub;
+    s.textContent += (s.textContent ? " · " : "") + "🔋 low";
+  }
 
   telemEls.peerMoving.textContent = p.ext
     ? (p.ext.speed > 2 ? `${fmtBearing(p.ext.course)} at ${p.ext.speed} km/h` : "stationary")
     : DASH;
-  telemEls.peerFix.textContent = p.ext
-    ? `${FIX_NAMES[p.ext.fixType] ?? p.ext.fixType} · ±${p.ext.hacc} m`
-    : DASH;
-  if (p.alt !== undefined && myPos && myPos.alt !== undefined && Math.abs(p.alt - myPos.alt) >= 10) {
+  // Their fix: plain quality word + accuracy; exact type in the tooltip.
+  if (p.ext) {
+    telemEls.peerFix.textContent = `${fixGrade(p.ext.fixType)} · ±${p.ext.hacc} m`;
+    telemEls.peerFix.title = `${FIX_NAMES[p.ext.fixType] ?? p.ext.fixType} · ±${p.ext.hacc} m accuracy`;
+  } else {
+    telemEls.peerFix.textContent = DASH;
+  }
+  // Elevation relative to you: "12 m above you" / "8 m below you" / "about level".
+  if (p.alt !== undefined && myPos && myPos.alt !== undefined) {
     const dAlt = p.alt - myPos.alt;
-    telemEls.peerAlt.textContent = `${dAlt > 0 ? "+" : ""}${dAlt} m`;
+    telemEls.peerAlt.textContent = Math.abs(dAlt) < 10 ? "about level"
+      : `${Math.abs(dAlt)} m ${dAlt > 0 ? "above you" : "below you"}`;
   } else {
     telemEls.peerAlt.textContent = DASH;
   }
   telemEls.peerBatt.textContent = fmtBatt(+p.batt, false);
+  // Signal: lead with the plain word, dBm after; SNR detail in the tooltip.
   if (p.rssi !== undefined) {
     const sw = signalWord(p.snr);
-    telemEls.peerSignal.textContent =
-      `${p.rssi} dBm · SNR ${p.snr} dB${sw ? " · " + sw.word : ""}`;
+    telemEls.peerSignal.textContent = `${sw ? cap(sw.word) : "—"} · ${p.rssi} dBm`;
+    telemEls.peerSignal.title = `RSSI ${p.rssi} dBm · SNR ${p.snr} dB`;
   } else {
     telemEls.peerSignal.textContent = DASH;
   }
-  telemEls.peerTrail.textContent = p.trail.length ? `${p.trail.length + 1} points` : DASH;
+  telemEls.peerTrail.textContent = p.trail.length ? `${p.trail.length + 1} recent spots` : DASH;
   telemEls.peerClient.textContent = p.client || DASH;
 }
 
