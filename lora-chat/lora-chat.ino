@@ -9,15 +9,17 @@
 //                      {"t":"client","v":"Chrome 126 · macOS · desktop"}
 //                      {"t":"join"}
 //                      {"t":"tx","id":7,"text":"hello"}
-//   board -> browser : {"t":"ready","fw":"1.5","freq":923.2,"name":"Joi"}
+//   board -> browser : {"t":"ready","fw":"1.6","freq":923.2,"name":"Joi"}
 //                      {"t":"rx","from":"Mai","text":"hi","rssi":-42,"snr":12.5}
 //                      {"t":"join","from":"Mai","rssi":-42,"snr":12.5,
 //                       "client":"Edge · Windows · desktop"}
 //                      {"t":"beacon","from":"Mai","rssi":-42,"snr":12.5,
 //                       "pos":{...},"ext":{"speed":4,"course":120,"hacc":4,"fixType":3}}
-//                      {"t":"gps",...,"speed":4.2,"course":118,"fixType":3,
-//                       "hacc":3.8,"pdop":1.6,"utc":"2026-06-13T06:40:12Z",
+//                      {"t":"gps",...,"sats":11,"siv":14,"speed":4.2,
+//                       "course":118,"fixType":3,"hacc":3.8,"pdop":1.6,
+//                       "utc":"2026-06-13T06:40:12Z",
 //                       "up":120,"noise":-104.5,"tx":3,"rx":2,"csave":47}
+//                       sats=used in fix (0=no fix); siv=satellites in view.
 //                      {"t":"sent","id":7}        radio TX completed
 //                      {"t":"ack","id":7}         remote board confirmed receipt
 //                      {"t":"err","msg":"..."}
@@ -157,7 +159,8 @@ float lastRSSI = 0, lastSNR = 0;
 // Own position / battery / motion (cached by pollGps — single getPVT poll)
 int32_t  myLat = 0, myLon = 0;   // degrees * 1e7
 int16_t  myAltM = 0;             // meters MSL
-uint8_t  mySats = 0;             // 0 = no fix
+uint8_t  mySats = 0;             // satellites used in the current valid fix (0 = no fix)
+uint8_t  mySiv = 0;              // satellites in view / tracked (independent of fix)
 uint8_t  myBatt = 0;             // volts * 20
 int32_t  mySpeedMms = 0;         // ground speed, mm/s
 uint16_t myCourseDeg = 0;        // course over ground, degrees
@@ -168,6 +171,8 @@ uint16_t myYear = 0;             // UTC date/time (valid when myTimeOk)
 uint8_t  myMonth = 0, myDay = 0, myHour = 0, myMin = 0, mySec = 0;
 bool     myTimeOk = false;
 uint32_t lastGpsPoll = 0, lastGpsReport = 0;
+uint32_t lastPvtOk = 0;          // last successful getPVT (for bounded staleness)
+static const uint32_t FIX_STALE_MS = 15000;  // give up on a held fix after this
 
 // Position beacon: starts after the browser joins; jittered so boards desync
 bool     hasJoined = false;
@@ -185,14 +190,22 @@ float readBattVolts() {
 void pollGps() {
   myBatt = (uint8_t)(readBattVolts() * 20.0f);
   if (!gpsOK) return;
-  if (!myGPS.getPVT(100)) {
-    mySats = 0;       // stale fix -> mark invalid, keep last lat/lon for OLED
-    myFixType = 0;
+  if (!myGPS.getPVT(250)) {
+    // Transient I2C/poll timeout: tolerate a few missed polls (keep the last
+    // fixType/siv/position so the browser doesn't flicker). But if the module
+    // stays unresponsive past FIX_STALE_MS — dead, unplugged, or a solar board
+    // brown-out loop — give up the held fix so we stop emitting/beaconing a
+    // frozen position. A real loss via a successful poll is handled below.
+    if (lastPvtOk && millis() - lastPvtOk > FIX_STALE_MS) {
+      mySats = 0;
+      myFixType = 0;
+    }
     return;
   }
+  lastPvtOk = millis();
   // One PVT poll; every getter below reads the cached message (no extra I2C)
   myFixType   = myGPS.getFixType();
-  uint8_t siv = myGPS.getSIV();
+  mySiv       = myGPS.getSIV();                     // tracked, regardless of fix
   mySpeedMms  = myGPS.getGroundSpeed();             // mm/s
   long crs    = myGPS.getHeading() / 100000L;       // deg*1e-5 -> deg
   myCourseDeg = (uint16_t)(((crs % 360) + 360) % 360);
@@ -203,12 +216,14 @@ void pollGps() {
     myYear = myGPS.getYear();  myMonth = myGPS.getMonth(); myDay = myGPS.getDay();
     myHour = myGPS.getHour();  myMin = myGPS.getMinute();  mySec = myGPS.getSecond();
   }
-  if (myFixType != 0 && siv > 3) {
+  // u-blox already encodes fix quality in fixType; require a 3D fix. (Dropping
+  // the old `siv > 3` gate kills the flicker that produced false "fix lost".)
+  if (myFixType >= 3) {
     myLat  = myGPS.getLatitude();
     myLon  = myGPS.getLongitude();
     long altMM = myGPS.getAltitudeMSL();
     myAltM = (int16_t)constrain(altMM / 1000, -32768L, 32767L);
-    mySats = siv;
+    mySats = mySiv;        // sats used in this valid fix
   } else {
     mySats = 0;
   }
@@ -220,6 +235,7 @@ void emitGps() {
   d["t"] = "gps";
   d["fix"] = (mySats > 0);
   d["sats"] = mySats;
+  d["siv"] = mySiv;
   d["fixType"] = myFixType;
   if (mySats > 0) {
     d["lat"] = serialized(String(myLat / 1e7, 7));
@@ -267,7 +283,7 @@ void onDio1(void) {
 void emitReady() {
   StaticJsonDocument<160> d;
   d["t"] = "ready";
-  d["fw"] = "1.5";
+  d["fw"] = "1.6";
   d["freq"] = LORA_FREQ;
   d["name"] = myName;
   if (nameLocked) d["locked"] = true;

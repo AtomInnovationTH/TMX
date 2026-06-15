@@ -368,12 +368,17 @@ let myName = localStorage.getItem("lorachat.name") || "";
 let webMsgId = 0;
 let myPos = null;   // {lat,lon,alt} — last good fix; kept through brief dropouts
 let myPosTs = 0;    // when myPos was last refreshed by a live fix
+let lastFixTs = 0;  // when we last had a live fix (for the holding/lost grace)
 let myGps = null;   // full last "gps" event from the board (telemetry panel)
 const battHist = [];             // [{t, v}] own battery, ~10 min window
 const BATT_HIST_MS = 10 * 60000;
 const bubblesById = new Map();   // webMsgId -> {meta, time, text, done} for ✓/retry
 const ackTimers = new Map();     // webMsgId -> failure timeout
 const ACK_FAIL_MS = 12000;       // board acks within ~5 s incl. its own retry
+// GPS fix state: a board polls every ~2 s and reports every ~5 s, and a marginal
+// signal flickers across the fix threshold. Don't shout "lost" on one dropped
+// sample — hold a calm "holding" state for a grace window first.
+const FIX_GRACE_MS = 30000;
 
 // ---------- Unread badge + sound ----------
 const BASE_TITLE = document.title;
@@ -440,19 +445,37 @@ function updateLink(rssi, snr) {
   els.linkpill.title = `Last received signal: ${rssi} dBm · SNR ${snr} dB`;
 }
 
+// Debounced GPS fix state, shared by the header pill, telemetry headline and
+// radar so they always agree. One of:
+//   live      — the current report has a fix
+//   holding   — no current fix, but within FIX_GRACE_MS of the last one (calm)
+//   lost       — no fix for longer than the grace, but a last-known pos is held
+//   searching — never had a fix this session
+function gpsState() {
+  const m = myGps;
+  if (m && m.fix) return "live";
+  if (!myPos) return "searching";
+  return (Date.now() - lastFixTs < FIX_GRACE_MS) ? "holding" : "lost";
+}
+
 // Header GPS pill: live fix, "lost · age" while holding a last fix, or no fix.
 function updateGpsPill() {
   const m = myGps;
   const low = m && m.batt > 0.5 && m.batt < LOW_BATT_V;
-  if (m && m.fix) {
+  const state = gpsState();
+  if (state === "live") {
     els.gpspill.textContent = `GPS ${m.sats} sats`;
     els.gpspill.title = `Your position: ${(+m.lat).toFixed(5)}, ${(+m.lon).toFixed(5)} · ${m.alt} m · ${m.batt} V`;
-  } else if (myPos) {
-    els.gpspill.textContent = `GPS lost · ${fmtAge(Date.now() - myPosTs)}`;
-    els.gpspill.title = `No current fix — showing last known position (${fmtAge(Date.now() - myPosTs)})`;
+  } else if (state === "holding") {
+    els.gpspill.textContent = `GPS holding · ${fmtAge(Date.now() - lastFixTs, true)}`;
+    els.gpspill.title = `Brief GPS gap — still showing your last position (last fix ${fmtAge(Date.now() - lastFixTs)})`;
+  } else if (state === "lost") {
+    els.gpspill.textContent = `GPS lost · ${fmtAge(Date.now() - lastFixTs, true)}`;
+    els.gpspill.title = `No fix for a while — showing last known position (last fix ${fmtAge(Date.now() - lastFixTs)})`;
   } else {
-    els.gpspill.textContent = "GPS no fix";
-    els.gpspill.title = m ? `Searching… · battery ${m.batt} V` : "Searching for satellites…";
+    const siv = m && m.siv !== undefined ? m.siv : (m ? m.sats : undefined);
+    els.gpspill.textContent = siv ? `GPS acquiring · ${siv} sats` : "GPS acquiring";
+    els.gpspill.title = m ? `Searching for satellites… · battery ${m.batt} V` : "Searching for satellites…";
   }
   if (low) { els.gpspill.textContent += " · 🔋⚠"; els.gpspill.title += ` · LOW BATTERY ${m.batt} V`; }
   els.gpspill.classList.toggle("lowbatt", !!low);
@@ -502,7 +525,8 @@ function describePeerPos(pos, { batt = true } = {}) {
       parts.push(`📍 ${pos.lat.toFixed(5)}, ${pos.lon.toFixed(5)}`);
     }
   }
-  if (batt && pos.batt > 0.5) parts.push(`🔋 ${pos.batt} V${pos.batt < LOW_BATT_V ? " ⚠" : ""}`);
+  if (batt && pos.batt > 0.5)
+    parts.push(pos.batt > 4.3 ? `🔌 ${pos.batt} V` : `🔋 ${pos.batt} V${pos.batt < LOW_BATT_V ? " ⚠" : ""}`);
   return parts.length ? parts.join("  ·  ") : null;
 }
 
@@ -558,8 +582,19 @@ function expirePeers() {
   for (const [name, p] of peers) if (now - p.ts > PEER_TTL_MS) peers.delete(name);
 }
 
-function fmtAge(ms) {
-  return ms < 60000 ? "now" : `${Math.round(ms / 60000)} min ago`;
+// Human "age" with sub-minute resolution, so a fresh value never reads "now"
+// for a whole minute. `bare` drops the trailing "ago" (for compact pills).
+function fmtAge(ms, bare) {
+  const s = Math.round(ms / 1000);
+  let out;
+  if (s < 5)        out = bare ? "now" : "just now";
+  else if (s < 60)  out = `${s}s`;
+  else if (s < 3600) out = `${Math.round(s / 60)} min`;
+  else {
+    const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+    out = m ? `${h}h ${m}m` : `${h}h`;
+  }
+  return bare || s < 5 ? out : out + " ago";
 }
 
 function drawRoster() {
@@ -590,8 +625,10 @@ function drawRoster() {
     chip.appendChild(sub);
     if (p.batt > 0.5) {
       const batt = document.createElement("span");
-      batt.className = "sub" + (p.batt < LOW_BATT_V ? " lowbatt" : "");
-      batt.textContent = `🔋 ${p.batt} V${p.batt < LOW_BATT_V ? " ⚠" : ""}`;
+      const onUsb = p.batt > 4.3;
+      const low = !onUsb && p.batt < LOW_BATT_V;
+      batt.className = "sub" + (low ? " lowbatt" : "");
+      batt.textContent = onUsb ? `🔌 ${p.batt} V` : `🔋 ${p.batt} V${low ? " ⚠" : ""}`;
       chip.appendChild(batt);
     }
     chip.title = (p.lat !== undefined ? `${name}: ${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}` : name)
@@ -639,7 +676,8 @@ function drawRadar() {
     els.radarMsg.textContent = "Waiting for your GPS fix…";
     return;
   }
-  const fixLost = !(myGps && myGps.fix);   // holding last known position
+  const state = gpsState();
+  const fixLost = state !== "live";   // holding/lost = coasting on last known
 
   const plotted = [...peers.entries()]
     .filter(([, p]) => p.lat !== undefined)
@@ -709,7 +747,10 @@ function drawRadar() {
   let radarMsg = plotted.length
     ? `Outer ring ${fmtDistance(scale)}`
     : "Peers appear here as their messages and beacons arrive";
-  if (fixLost) radarMsg = `GPS lost ${fmtAge(now - myPosTs)} · last known · ` + radarMsg;
+  if (state === "holding")
+    radarMsg = `GPS holding ${fmtAge(now - lastFixTs)} · last known · ` + radarMsg;
+  else if (state === "lost")
+    radarMsg = `GPS lost ${fmtAge(now - lastFixTs)} · last known · ` + radarMsg;
   els.radarMsg.textContent = radarMsg;
 }
 
@@ -735,6 +776,28 @@ function battTrendArrow() {
 function fmtUptime(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h ? `${h} h ${m} min` : m ? `${m} min` : `${s} s`;
+}
+
+// Rough 1S-LiPo state-of-charge from resting voltage (piecewise, presentational
+// only). Above ~4.3 V the board is on USB/charge power, not the cell.
+function lipoPct(v) {
+  const pts = [[3.30, 0], [3.50, 15], [3.70, 50], [3.85, 75], [4.20, 100]];
+  if (v <= pts[0][0]) return 0;
+  if (v >= pts[pts.length - 1][0]) return 100;
+  for (let i = 1; i < pts.length; i++) {
+    if (v <= pts[i][0]) {
+      const [v0, p0] = pts[i - 1], [v1, p1] = pts[i];
+      return Math.round(p0 + (p1 - p0) * (v - v0) / (v1 - v0));
+    }
+  }
+  return 100;
+}
+// Battery label: USB/charging above 4.3 V, else volts + LiPo % + trend + low.
+function fmtBatt(v, withTrend) {
+  if (!(v > 0.5)) return DASH;
+  const trend = withTrend ? battTrendArrow() : "";
+  if (v > 4.3) return `${v} V · USB/charging`;
+  return `${v} V · ~${lipoPct(v)}%${trend}${v < LOW_BATT_V ? " · low" : ""}`;
 }
 
 // Overall GPS fix quality from data the board already sends (no firmware change):
@@ -857,6 +920,7 @@ function buildTelemSkeleton() {
   telemEls.mineHead = thHead(mine);
   telemEls.mineQuality = thGauge(mine, "Fix quality",
     "Overall GPS health from sats used, geometry (pDOP) and accuracy");
+  telemEls.mineSats = thRow(mine, "Sats", "Satellites used in the fix / tracked in view");
   telemEls.minePos = thRow(mine, "Position", "Click to copy coordinates");
   telemEls.minePos.addEventListener("click", () => {
     if (mineCoords && navigator.clipboard) navigator.clipboard.writeText(mineCoords);
@@ -864,12 +928,11 @@ function buildTelemSkeleton() {
   telemEls.mineSpeed = thRow(mine, "Speed");
   telemEls.mineBatt  = thRow(mine, "Battery", "Trend arrow: charging/draining over the last 10 min");
   thSub(mine, "Diagnostics");
-  telemEls.mineGeom  = thRow(mine, "Geometry", "Lower pDOP = better satellite geometry");
   telemEls.mineUtc   = thRow(mine, "UTC", "Satellite-synced clock from the board");
   telemEls.mineUp    = thRow(mine, "Uptime");
   telemEls.minePkts  = thRow(mine, "Packets");
   telemEls.mineSave  = thRow(mine, "Compression", "Air-bytes saved by smaz text compression");
-  telemEls.mineChan  = thRow(mine, "Channel", "Noise floor while idle — lower is a quieter channel");
+  telemEls.mineChan  = thRow(mine, "Noise floor", "Idle RX noise floor — lower is a quieter channel");
 
   const pp = els.telemPeer;
   pp.replaceChildren();
@@ -986,21 +1049,36 @@ function renderTelemetry() {
 
   // --- my board: same rows every time; missing data shows "—" ---
   const m = myGps;
-  const fixLost = !(m && m.fix);
+  const state = gpsState();
+  const fixLost = state !== "live";
   if (!m) {
     setHead(telemEls.mineHead, "", "Waiting for board…", "");
-  } else if (m.fix) {
+  } else if (state === "live") {
     setHead(telemEls.mineHead, "good", `${FIX_NAMES[m.fixType] ?? "fix"} · ${m.sats} sats`,
             m.hacc !== undefined ? `±${m.hacc} m` : "");
-  } else if (myPos) {
-    setHead(telemEls.mineHead, "warn", "GPS fix lost", `last fix ${fmtAge(now - myPosTs)}`);
+  } else if (state === "holding") {
+    setHead(telemEls.mineHead, "warn", "Holding fix", `last fix ${fmtAge(now - lastFixTs)}`);
+  } else if (state === "lost") {
+    setHead(telemEls.mineHead, "bad", "No fix", `last seen ${fmtAge(now - lastFixTs)}`);
   } else {
-    setHead(telemEls.mineHead, "bad", "No GPS fix",
-            m.sats !== undefined ? `${m.sats} sats in view` : "searching…");
+    const siv = m.siv !== undefined ? m.siv : m.sats;
+    setHead(telemEls.mineHead, "bad", "Acquiring…",
+            siv !== undefined ? `${siv} sats in view` : "searching…");
   }
 
   const q = fixQuality(m);
   telemEls.mineQuality.set(q.level, q.cls, q.text);
+
+  // Sats: used in fix / tracked in view (the honest "GPS strength" read).
+  // Only the live fix has a meaningful "used" count; while holding/lost/acquiring
+  // show "—" for used so it doesn't contradict the "Holding fix" headline.
+  if (m && (m.siv !== undefined || m.sats !== undefined)) {
+    const used = state === "live" ? (m.sats ?? 0) : DASH;
+    const inView = m.siv !== undefined ? m.siv : (state === "live" ? (m.sats ?? 0) : 0);
+    telemEls.mineSats.textContent = `${used} used · ${inView} in view`;
+  } else {
+    telemEls.mineSats.textContent = DASH;
+  }
 
   const showPos = m && m.fix ? { lat: +m.lat, lon: +m.lon, alt: m.alt } : myPos;
   if (showPos) {
@@ -1019,14 +1097,9 @@ function renderTelemetry() {
     m && m.fix && m.speed !== undefined
       ? `${m.speed} km/h` + (+m.speed > 2 ? ` ${fmtBearing(m.course)}` : "")
       : DASH;
-  telemEls.mineGeom.textContent =
-    m && m.fix && m.pdop !== undefined ? `pDOP ${m.pdop}` : DASH;
   telemEls.mineUtc.textContent =
     m && m.utc ? m.utc.replace("T", " ").replace("Z", "") : DASH;
-  telemEls.mineBatt.textContent =
-    m && m.batt > 0.5
-      ? `${m.batt} V${battTrendArrow()}${m.batt < LOW_BATT_V ? " · low" : ""}`
-      : DASH;
+  telemEls.mineBatt.textContent = m ? fmtBatt(+m.batt, true) : DASH;
   telemEls.mineUp.textContent = m && m.up !== undefined ? fmtUptime(m.up) : DASH;
   telemEls.minePkts.textContent = m && m.tx !== undefined ? `${m.tx} tx · ${m.rx} rx` : DASH;
   telemEls.mineSave.textContent =
@@ -1075,8 +1148,7 @@ function renderTelemetry() {
   } else {
     telemEls.peerAlt.textContent = DASH;
   }
-  telemEls.peerBatt.textContent =
-    p.batt > 0.5 ? `${p.batt} V${p.batt < LOW_BATT_V ? " · low" : ""}` : DASH;
+  telemEls.peerBatt.textContent = fmtBatt(+p.batt, false);
   if (p.rssi !== undefined) {
     const sw = signalWord(p.snr);
     telemEls.peerSignal.textContent =
@@ -1425,7 +1497,7 @@ function handleBoardEvent(m) {
         while (battHist.length && Date.now() - battHist[0].t > BATT_HIST_MS) battHist.shift();
       }
       // Keep the last good fix through brief dropouts instead of blanking.
-      if (m.fix) { myPos = { lat: m.lat, lon: m.lon, alt: m.alt }; myPosTs = Date.now(); }
+      if (m.fix) { myPos = { lat: m.lat, lon: m.lon, alt: m.alt }; myPosTs = Date.now(); lastFixTs = Date.now(); }
       updateGpsPill();
       if (radarOn) drawRadar();
       drawRoster();   // distances depend on our own position
