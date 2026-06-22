@@ -854,12 +854,13 @@ function solveMesh() {
 }
 
 // hollow dashed "~" marker + dashed uncertainty halo for an RSSI-estimated unit
-function drawEstNode(svg, x, y, name, sigma, scale, R) {
+function drawEstNode(svg, x, y, name, sigma, scale, R, color) {
+  const c = color || "var(--accent)";
   const pr = Math.min((sigma || 40) / scale, 1) * R;
   if (pr >= 1) svg.appendChild(svgEl("circle", { cx: x, cy: y, r: pr,
-    style: "fill:var(--accent);opacity:.08;stroke:var(--accent);stroke-opacity:.35;stroke-dasharray:3 3" }));
+    style: `fill:${c};opacity:.08;stroke:${c};stroke-opacity:.35;stroke-dasharray:3 3` }));
   svg.appendChild(svgEl("circle", { cx: x, cy: y, r: 5,
-    style: "fill:none;stroke:var(--accent);stroke-width:1.6;stroke-dasharray:2.5 2" }));
+    style: `fill:none;stroke:${c};stroke-width:1.6;stroke-dasharray:2.5 2` }));
   svg.appendChild(svgEl("text", { x, y: y - 9, "text-anchor": "middle", style: "fill:var(--muted);font-size:11px" }, name + " ~"));
 }
 
@@ -869,14 +870,15 @@ function drawRelativeMesh(svg, C, R, label) {
   let maxD = 1; for (const [, e] of est) maxD = Math.max(maxD, Math.hypot(e.enu.x, e.enu.y));
   const scale = niceScale(Math.max(100, maxD * 1.15));
   svg.appendChild(svgEl("text", { x: C + 5, y: C - R + 22, style: label }, fmtDistance(scale)));
-  svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5, style: "fill:var(--accent)" }));
+  svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5, style: "fill:var(--bubble-me)" }));  // you = green
   svg.appendChild(svgEl("text", { x: C, y: C - 9, "text-anchor": "middle",
     style: "fill:var(--text);font-size:11px;font-weight:600" }, meshResult.meName));
   for (const [nm, e] of est) {
     if (nm === meshResult.meName) continue;
     const d = Math.hypot(e.enu.x, e.enu.y), b = (Math.atan2(e.enu.x, e.enu.y) * 180 / Math.PI + 360) % 360;
     const r = Math.min(d / scale, 1) * R;
-    drawEstNode(svg, C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r, nm, meshResult.sigma, scale, R);
+    drawEstNode(svg, C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r,
+                nm, meshResult.sigma, scale, R, nodeColor(nm, false));
   }
   els.radarMsg.textContent = `Relative layout · no GPS · orientation arbitrary · est. ring ${fmtDistance(scale)}`;
 }
@@ -907,6 +909,10 @@ function drawRoster() {
     chip.className = "chip" + (now - p.ts > 120000 ? " stale" : "")
                    + (name === focused ? " focused" : "");
     chip.addEventListener("click", () => focusPeer(name));
+    const sw = document.createElement("span");   // colour swatch = this board's radar/avatar colour
+    sw.style.cssText = `display:inline-block;width:8px;height:8px;border-radius:50%;`
+                     + `background:${nodeColor(name, false)};margin-right:5px;vertical-align:middle`;
+    chip.appendChild(sw);
     const b = document.createElement("b");
     b.textContent = name;
     chip.appendChild(b);
@@ -1040,8 +1046,9 @@ function drawRadar() {
     return [C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r];
   };
 
-  // center: us (accent), or the reference peer (green) when we have no fix
-  const centerColor = refIsSelf ? "var(--accent)" : "var(--ok)";
+  // center: you (green, like your own chat bubbles), or the reference peer
+  // (its own avatar colour) when we have no fix
+  const centerColor = nodeColor(refName, refIsSelf);
   accCircle(svg, C, C, refHacc, centerColor);
   svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5,
     style: `fill:${centerColor}` + (fixLost ? ";opacity:.4" : "") }));
@@ -1050,7 +1057,7 @@ function drawRadar() {
     svg.appendChild(svgEl("line", {
       x1: C + Math.sin(ca) * 6,  y1: C - Math.cos(ca) * 6,
       x2: C + Math.sin(ca) * 15, y2: C - Math.cos(ca) * 15,
-      style: "stroke:var(--accent);stroke-width:2.5;stroke-linecap:round",
+      style: `stroke:${centerColor};stroke-width:2.5;stroke-linecap:round`,
     }));
   }
   if (!refIsSelf)
@@ -1058,6 +1065,7 @@ function drawRadar() {
       style: "fill:var(--text);font-size:11px;font-weight:600" }, refName));
 
   for (const { name, p, d, b } of plotted) {
+    const col = nodeColor(name, false);   // each peer keeps its avatar colour
     const r = Math.min(d / scale, 1) * R;
     const x = C + Math.sin(b * Math.PI / 180) * r;
     const y = C - Math.cos(b * Math.PI / 180) * r;
@@ -1072,18 +1080,18 @@ function drawRadar() {
         .join(" ");
       g.appendChild(svgEl("polyline", {
         points: pts,
-        style: "fill:none;stroke:var(--ok);stroke-width:1.5;stroke-dasharray:3 3;opacity:.45",
+        style: `fill:none;stroke:${col};stroke-width:1.5;stroke-dasharray:3 3;opacity:.45`,
       }));
     }
-    accCircle(g, x, y, p.ext && p.ext.hacc, "var(--ok)");
-    g.appendChild(svgEl("circle", { cx: x, cy: y, r: 5, style: "fill:var(--ok)" }));
+    accCircle(g, x, y, p.ext && p.ext.hacc, col);
+    g.appendChild(svgEl("circle", { cx: x, cy: y, r: 5, style: `fill:${col}` }));
     // course arrow when the peer reports motion (beacon ext payload)
     if (p.ext && p.ext.speed > 2 && p.ext.course !== undefined) {
       const ca = p.ext.course * Math.PI / 180;
       g.appendChild(svgEl("line", {
         x1: x + Math.sin(ca) * 6,  y1: y - Math.cos(ca) * 6,
         x2: x + Math.sin(ca) * 14, y2: y - Math.cos(ca) * 14,
-        style: "stroke:var(--ok);stroke-width:2.5;stroke-linecap:round",
+        style: `stroke:${col};stroke-width:2.5;stroke-linecap:round`,
       }));
     }
     g.appendChild(svgEl("text", { x, y: y - 9, "text-anchor": "middle",
@@ -1104,7 +1112,7 @@ function drawRadar() {
       const d = Math.hypot(t.x, t.y), b = (Math.atan2(t.x, t.y) * 180 / Math.PI + 360) % 360;
       const r = Math.min(d / scale, 1) * R;
       drawEstNode(svg, C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r,
-                  nm, meshResult.sigma, scale, R);
+                  nm, meshResult.sigma, scale, R, nodeColor(nm, nm === meshResult.meName));
       estCount++;
     }
   }
@@ -1724,6 +1732,12 @@ function avatarColor(name) {
   let h = 0;
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
   return `hsl(${h} 60% 45%)`;
+}
+// Map a board to its colour: you are always the LINE-green of your own chat
+// bubbles; every other board gets its stable per-name avatar hue (so the same
+// board reads the same colour on the radar, roster and chat).
+function nodeColor(name, isSelf) {
+  return isSelf ? "var(--bubble-me)" : avatarColor(name || "");
 }
 function avatarInitial(name) {
   const c = (name || "").trim()[0];
