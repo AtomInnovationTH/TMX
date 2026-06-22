@@ -9,12 +9,18 @@
 //                      {"t":"client","v":"Chrome 126 · macOS · desktop"}
 //                      {"t":"join"}
 //                      {"t":"tx","id":7,"text":"hello"}
-//   board -> browser : {"t":"ready","fw":"1.6","freq":923.2,"name":"Joi"}
-//                      {"t":"rx","from":"Mai","text":"hi","rssi":-42,"snr":12.5}
-//                      {"t":"join","from":"Mai","rssi":-42,"snr":12.5,
+//   board -> browser : {"t":"ready","fw":"1.7","freq":923.2,"name":"Joi","id":4321}
+//                      {"t":"rx","from":"Mai","id":2048,"text":"hi","rssi":-42,"snr":12.5}
+//                      {"t":"join","from":"Mai","id":2048,"rssi":-42,"snr":12.5,
 //                       "client":"Edge · Windows · desktop"}
-//                      {"t":"beacon","from":"Mai","rssi":-42,"snr":12.5,
-//                       "pos":{...},"ext":{"speed":4,"course":120,"hacc":4,"fixType":3}}
+//                      {"t":"beacon","from":"Mai","id":2048,"rssi":-42,"snr":12.5,
+//                       "pos":{...},"ext":{"speed":4,"course":120,"hacc":4,"fixType":3},
+//                       "nb":[{"id":4321,"rssi":-55},{"id":7777,"rssi":-88}]}
+//                       id  = sender's per-boot senderId (fw 1.7+; lets the app
+//                             map names<->ids for mesh trilateration).
+//                       nb  = neighbours the sender currently hears + their RSSI
+//                             (fw 1.7+), so one connected board can recover the
+//                             whole pairwise link matrix, not just its own row.
 //                      {"t":"gps",...,"sats":11,"siv":14,"speed":4.2,
 //                       "course":118,"fixType":3,"hacc":3.8,"pdop":1.6,
 //                       "utc":"2026-06-13T06:40:12Z",
@@ -48,6 +54,10 @@
 //                   fix held; unknown to fw <=1.1, which ignores type 3).
 //                   fw 1.5+ also sends ONE beacon on boot (every board) as a
 //                   presence/power ping, and labeled boards beacon autonomously.
+//                   fw 1.7+ appends a neighbour block after the 4 ext bytes:
+//                   [count:u8][ {senderId:2 LE}{rssi:i8 dBm} x count ] (up to 6,
+//                   freshest first). Older boards read only the 4 ext bytes and
+//                   ignore the rest; new boards decode it into the `nb` event.
 //   trailer (when type bit7 set, appended after payload):
 //           [lat:i32 deg*1e7][lon:i32 deg*1e7][alt:i16 m][sats:u8][batt:u8 V*20]
 //
@@ -142,6 +152,34 @@ uint8_t  pendingRetries = 0;
 static const uint8_t DEDUPE_N = 8;
 uint32_t dedupeRing[DEDUPE_N] = {0};
 uint8_t  dedupeIdx = 0;
+
+// ---------- Neighbour RSSI table (mesh trilateration, fw 1.7) ----------
+// We remember the last RSSI at which we heard each peer, and rebroadcast a small
+// slice of this table in every beacon. A single USB-connected board then sees
+// not just "how far is each peer from me" (its own RX RSSI) but the whole
+// pairwise link matrix, which is what the web app needs to lay out a relative
+// constellation (and anchor it once any node has GPS).
+static const uint8_t  NB_MAX        = 8;       // peers tracked locally
+static const uint8_t  NB_REPORT_MAX = 6;       // peers attached to one beacon
+static const uint32_t NB_STALE_MS   = 300000;  // forget a peer after 5 min silence
+struct Neighbor { uint16_t id; int8_t rssi; uint32_t seen; };
+Neighbor nbTable[NB_MAX];
+uint8_t  nbCount = 0;
+
+void noteNeighbor(uint16_t id, float rssi) {
+  int8_t r = (int8_t)constrain((long)lroundf(rssi), -128L, 127L);  // dBm fits i8
+  uint32_t now = millis();
+  for (uint8_t i = 0; i < nbCount; i++) {
+    if (nbTable[i].id == id) { nbTable[i].rssi = r; nbTable[i].seen = now; return; }
+  }
+  if (nbCount < NB_MAX) {
+    nbTable[nbCount++] = { id, r, now };
+  } else {                                  // evict the stalest entry
+    uint8_t oldest = 0;
+    for (uint8_t i = 1; i < NB_MAX; i++) if (nbTable[i].seen < nbTable[oldest].seen) oldest = i;
+    nbTable[oldest] = { id, r, now };
+  }
+}
 
 // Serial line buffer
 static const size_t LINE_MAX = 360;
@@ -283,9 +321,10 @@ void onDio1(void) {
 void emitReady() {
   StaticJsonDocument<160> d;
   d["t"] = "ready";
-  d["fw"] = "1.6";
+  d["fw"] = "1.7";
   d["freq"] = LORA_FREQ;
   d["name"] = myName;
+  d["id"] = myId;
   if (nameLocked) d["locked"] = true;
   serializeJson(d, SerialUSB);
   SerialUSB.println();
@@ -455,6 +494,7 @@ void handleRadioPacket() {
   }
 
   bool duplicate = seenBefore(sender, msgId);
+  noteNeighbor(sender, rssi);   // track link quality for mesh trilateration (fw 1.7)
 
   if (type == TYPE_CHAT) {
     // Always ack (the previous ack may have been lost), but only show once
@@ -475,6 +515,7 @@ void handleRadioPacket() {
     StaticJsonDocument<512> d;
     d["t"] = "rx";
     d["from"] = from;
+    d["id"] = sender;
     d["text"] = text;
     d["rssi"] = serialized(String(rssi, 1));
     d["snr"]  = serialized(String(snr, 1));
@@ -502,6 +543,7 @@ void handleRadioPacket() {
     StaticJsonDocument<320> d;
     d["t"] = "join";
     d["from"] = from;
+    d["id"] = sender;
     d["rssi"] = serialized(String(rssi, 1));
     d["snr"]  = serialized(String(snr, 1));
     // Optional client/app profile carried in the JOIN payload (fw 1.5+).
@@ -536,9 +578,10 @@ void handleRadioPacket() {
 
   } else if (type == TYPE_BEACON) {
     if (duplicate || !hasPos) return;
-    StaticJsonDocument<384> d;
+    StaticJsonDocument<768> d;   // headroom for pos + ext + up to 6 nb entries
     d["t"] = "beacon";
     d["from"] = from;
+    d["id"] = sender;
     d["rssi"] = serialized(String(rssi, 1));
     d["snr"]  = serialized(String(snr, 1));
     JsonObject pos = d.createNestedObject("pos");
@@ -555,6 +598,19 @@ void handleRadioPacket() {
       ext["course"]  = payload[1] * 2;      // deg
       ext["hacc"]    = payload[2];          // m
       ext["fixType"] = payload[3];
+    }
+    // fw 1.7+ neighbour block: [count][ {id:2}{rssi:i8} x count ]
+    if (payloadLen >= 5) {
+      uint8_t nb = payload[4];
+      if (nb > 0 && payloadLen >= (size_t)(5 + nb * 3)) {
+        JsonArray arr = d.createNestedArray("nb");
+        for (uint8_t i = 0; i < nb; i++) {
+          const uint8_t* e = payload + 5 + i * 3;
+          JsonObject o = arr.createNestedObject();
+          o["id"]   = (uint16_t)(e[0] | (e[1] << 8));
+          o["rssi"] = (int8_t)e[2];
+        }
+      }
     }
     serializeJson(d, SerialUSB);
     SerialUSB.println();
@@ -691,18 +747,30 @@ void checkAckRetry() {
 }
 
 // Broadcast one position beacon: name + battery + position (if a fix is held) +
-// motion ext. Used for the boot ping and the periodic beacon.
+// motion ext + a slice of our neighbour-RSSI table (fw 1.7). Used for the boot
+// ping and the periodic beacon.
 void sendBeacon() {
   long kmh = mySpeedMms > 0 ? (mySpeedMms * 9L) / 2500L : 0;   // mm/s -> km/h
   uint32_t haccM = myHaccMm / 1000;
-  uint8_t ext[4] = {
-    (uint8_t)(kmh > 255 ? 255 : kmh),
-    (uint8_t)(myCourseDeg / 2),
-    (uint8_t)(haccM > 255 ? 255 : haccM),
-    myFixType
-  };
+  uint8_t pl[4 + 1 + NB_REPORT_MAX * 3];
+  pl[0] = (uint8_t)(kmh > 255 ? 255 : kmh);
+  pl[1] = (uint8_t)(myCourseDeg / 2);
+  pl[2] = (uint8_t)(haccM > 255 ? 255 : haccM);
+  pl[3] = myFixType;
+  // Append up to NB_REPORT_MAX fresh neighbours: [count][ {id:2 LE}{rssi:i8} ].
+  uint8_t n = 0;
+  size_t off = 5;
+  uint32_t now = millis();
+  for (uint8_t i = 0; i < nbCount && n < NB_REPORT_MAX; i++) {
+    if (now - nbTable[i].seen > NB_STALE_MS) continue;
+    pl[off++] = nbTable[i].id & 0xFF;
+    pl[off++] = nbTable[i].id >> 8;
+    pl[off++] = (uint8_t)nbTable[i].rssi;   // i8 dBm as raw byte
+    n++;
+  }
+  pl[4] = n;
   uint8_t frame[MAX_FRAME];
-  size_t len = buildFrame(frame, TYPE_BEACON, ++txMsgId, ext, sizeof(ext), true, false);
+  size_t len = buildFrame(frame, TYPE_BEACON, ++txMsgId, pl, off, true, false);
   transmitFrame(frame, len);
 }
 

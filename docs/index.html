@@ -337,6 +337,8 @@
       <div id="telemPeer"></div>
       <h3>My board</h3>
       <div id="telemMine"></div>
+      <h3>Mesh positioning</h3>
+      <div id="telemMesh"></div>
       <h3>This device</h3>
       <div id="telemBrowser"></div>
     </div>
@@ -365,6 +367,7 @@ const els = {
   resetBtn: $("resetBtn"),
   telemMine: $("telemMine"), telemPeer: $("telemPeer"),
   telemPeerName: $("telemPeerName"), telemBrowser: $("telemBrowser"),
+  telemMesh: $("telemMesh"),
 };
 
 let port = null, reader = null, writer = null;
@@ -546,12 +549,22 @@ const SVGNS = "http://www.w3.org/2000/svg";
 const PEER_TTL_MS = 15 * 60000;   // drop peers not heard from in 15 min
 const TRAIL_MAX = 20;             // breadcrumb points kept per peer
 
-function notePeer(from, pos, rssi, snr, ext, client) {
+// Mesh trilateration (fw 1.7): our board's per-boot senderId, a senderId->name
+// directory learned from events, and the latest constellation solve.
+let myBoardId = null;
+const idToName = new Map();
+let meshResult = null;            // see solveMesh()
+let meshSolveTimer = null;
+let meshWarmByName = new Map();   // warm-start coords keyed by node name
+
+function notePeer(from, pos, rssi, snr, ext, client, id, nb) {
   const p = peers.get(from) || { trail: [] };
   p.ts = Date.now();
-  if (rssi !== undefined) { p.rssi = rssi; p.snr = snr; }
+  if (rssi !== undefined) { p.rssi = rssi; p.snr = snr; p.rssiTs = Date.now(); }
   if (ext) p.ext = ext;
   if (client) p.client = client;
+  if (id !== undefined) { p.id = id; idToName.set(id, from); }
+  if (nb) { p.nbRaw = nb; p.nbTs = Date.now(); }   // peers THIS node currently hears
   if (pos) {
     p.batt = pos.batt;
     p.sats = pos.sats;
@@ -564,6 +577,7 @@ function notePeer(from, pos, rssi, snr, ext, client) {
     }
   }
   peers.set(from, p);
+  scheduleMeshSolve();
   drawRadar();
   drawRoster();
   renderTelemetry();
@@ -586,6 +600,285 @@ function focusPeer(name) {
 function expirePeers() {
   const now = Date.now();
   for (const [name, p] of peers) if (now - p.ts > PEER_TTL_MS) peers.delete(name);
+}
+
+// ======================================================================
+// Mesh positioning (fw 1.7): RSSI trilateration + GPS anchoring/calibration.
+//
+// Every board rebroadcasts the RSSI at which it hears its neighbours (the `nb`
+// array on each beacon), so this one connected board recovers the *pairwise*
+// link matrix among all units — not just its own row. We turn each link's RSSI
+// into a rough distance (log-distance path-loss model), lay the units out with
+// weighted MDS (SMACOF), then — if any unit has GPS — pin/orient that relative
+// "constellation" onto real coordinates (Procrustes) and, with ≥2 GPS units,
+// auto-calibrate the path-loss model from the known true distances.
+//
+// It is deliberately coarse: RSSI ranging is ±tens of percent, so estimates are
+// drawn with big dashed uncertainty halos and a hollow "~" marker.
+// ======================================================================
+
+// log-distance path-loss model: RSSI(d) = P0 - 10·n·log10(d)
+const RSSI_CAL_KEY = "lorachat.rssical";
+let rssiCal = (() => {
+  try { const v = JSON.parse(localStorage.getItem(RSSI_CAL_KEY)); if (v && v.n > 0 && isFinite(v.p0)) return v; }
+  catch (e) {}
+  return { p0: -43, n: 2.5 };   // sane outdoor-ish defaults until calibrated
+})();
+function saveCal() { try { localStorage.setItem(RSSI_CAL_KEY, JSON.stringify(rssiCal)); } catch (e) {} }
+function rssiToDist(rssi) { return Math.pow(10, (rssiCal.p0 - rssi) / (10 * rssiCal.n)); }
+function distToRssi(d) { return rssiCal.p0 - 10 * rssiCal.n * Math.log10(Math.max(d, 0.1)); }
+const meanOf = a => a.reduce((x, y) => x + y, 0) / a.length;
+
+// Least-squares fit of {p0,n} to (rssi,dist) ground-truth pairs (from GPS units).
+function calibrate(pairs, prior) {
+  const pts = pairs.filter(p => p.dist > 0.5 && isFinite(p.rssi));
+  if (pts.length < 2) {
+    if (pts.length === 1) { const p = pts[0]; return { p0: p.rssi + 10 * prior.n * Math.log10(p.dist), n: prior.n }; }
+    return prior;
+  }
+  let sx = 0, sy = 0, sxx = 0, sxy = 0; const k = pts.length;
+  for (const p of pts) { const x = Math.log10(p.dist); sx += x; sy += p.rssi; sxx += x * x; sxy += x * p.rssi; }
+  const denom = k * sxx - sx * sx;
+  if (Math.abs(denom) < 1e-9) return prior;
+  const slope = (k * sxy - sx * sy) / denom;     // = -10n
+  const intercept = (sy - slope * sx) / k;        // = P0
+  let n = -slope / 10;
+  if (!(n > 0.3)) n = 0.3; if (n > 6) n = 6;       // clamp to a physical range
+  return { p0: intercept, n };
+}
+
+// ---- weighted, missing-aware MDS via SMACOF (per-point Guttman update) ----
+function meshSeed(N, seed) {
+  let s = seed >>> 0 || 1;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  const X = [];
+  for (let i = 0; i < N; i++) X.push({ x: (rnd() - 0.5) * 200, y: (rnd() - 0.5) * 200 });
+  return X;
+}
+function meshStress(N, dist, w, X) {
+  let s = 0;
+  for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+    const wij = w[i][j]; if (!(wij > 0)) continue;
+    const dij = dist[i][j]; if (!(dij >= 0)) continue;
+    s += wij * (Math.hypot(X[i].x - X[j].x, X[i].y - X[j].y) - dij) ** 2;
+  }
+  return s;
+}
+function smacofOnce(N, dist, w, X, iters) {
+  for (let it = 0; it < iters; it++) {
+    const acc = X.map(() => ({ x: 0, y: 0, wsum: 0 }));
+    for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+      if (i === j) continue;
+      const wij = w[i][j]; if (!(wij > 0)) continue;
+      const dij = dist[i][j]; if (!(dij >= 0)) continue;
+      let dx = X[i].x - X[j].x, dy = X[i].y - X[j].y;
+      let nrm = Math.hypot(dx, dy); if (nrm < 1e-9) { nrm = 1e-9; dx = 1e-9; }
+      acc[i].x += wij * (X[j].x + dij * dx / nrm);
+      acc[i].y += wij * (X[j].y + dij * dy / nrm);
+      acc[i].wsum += wij;
+    }
+    for (let i = 0; i < N; i++) if (acc[i].wsum > 0) X[i] = { x: acc[i].x / acc[i].wsum, y: acc[i].y / acc[i].wsum };
+  }
+  return X;
+}
+// Multi-restart SMACOF (MDS has local minima); keep the lowest-stress layout.
+function smacof(N, dist, w, opts = {}) {
+  const iters = opts.iters || 300, restarts = opts.restarts || 10;
+  const inits = [];
+  if (opts.init && opts.init.length === N) inits.push(opts.init.map(p => ({ x: p.x, y: p.y })));
+  for (let r = 0; r < restarts; r++) inits.push(meshSeed(N, (opts.seed || 1) + r * 1013));
+  let best = null, bestS = Infinity;
+  for (const init of inits) {
+    const X = smacofOnce(N, dist, w, init, iters);
+    const s = meshStress(N, dist, w, X);
+    if (s < bestS) { bestS = s; best = X; }
+  }
+  return best;
+}
+
+// ---- similarity transform src->dst (complex LS; reflection allowed) ----
+// Distances are reflection-invariant, so we try both handednesses and keep the
+// better fit. Returns { rms, apply(point) } or null.
+function fitSimilarity(src, dst) {
+  const n = src.length;
+  if (n < 2) return null;
+  const mz = { x: 0, y: 0 }, my = { x: 0, y: 0 };
+  for (let i = 0; i < n; i++) { mz.x += src[i].x; mz.y += src[i].y; my.x += dst[i].x; my.y += dst[i].y; }
+  mz.x /= n; mz.y /= n; my.x /= n; my.y /= n;
+  const solve = conj => {
+    let sRe = 0, sIm = 0, den = 0;
+    for (let i = 0; i < n; i++) {
+      let ux = src[i].x - mz.x, uy = src[i].y - mz.y; if (conj) uy = -uy;
+      const vx = dst[i].x - my.x, vy = dst[i].y - my.y;
+      sRe += ux * vx + uy * vy; sIm += ux * vy - uy * vx; den += ux * ux + uy * uy;
+    }
+    if (den < 1e-9) return null;
+    const aRe = sRe / den, aIm = sIm / den;
+    let err = 0;
+    for (let i = 0; i < n; i++) {
+      let ux = src[i].x - mz.x, uy = src[i].y - mz.y; if (conj) uy = -uy;
+      err += (aRe * ux - aIm * uy - (dst[i].x - my.x)) ** 2 + (aRe * uy + aIm * ux - (dst[i].y - my.y)) ** 2;
+    }
+    return { aRe, aIm, conj, err };
+  };
+  const cands = [solve(false), solve(true)].filter(Boolean);
+  if (!cands.length) return null;
+  cands.sort((a, b) => a.err - b.err);
+  const best = cands[0];
+  return {
+    rms: Math.sqrt(best.err / n),
+    apply(p) {
+      let ux = p.x - mz.x, uy = p.y - mz.y; if (best.conj) uy = -uy;
+      return { x: best.aRe * ux - best.aIm * uy + my.x, y: best.aRe * uy + best.aIm * ux + my.y };
+    },
+  };
+}
+
+// ---- local-tangent-plane (ENU) helpers, metres relative to an origin lat/lon ----
+function enuFrom(origin, ll) {
+  const lat0 = origin.lat * Math.PI / 180;
+  return { x: (ll.lon - origin.lon) * Math.cos(lat0) * 111320, y: (ll.lat - origin.lat) * 110540 };
+}
+function llFromEnu(origin, p) {
+  const lat0 = origin.lat * Math.PI / 180;
+  return { lat: origin.lat + p.y / 110540, lon: origin.lon + p.x / (Math.cos(lat0) * 111320) };
+}
+
+const MESH_LINK_TTL = 5 * 60000;   // ignore RSSI links older than 5 min
+
+function scheduleMeshSolve() {
+  if (meshSolveTimer) return;
+  meshSolveTimer = setTimeout(() => {
+    meshSolveTimer = null;
+    try { solveMesh(); } catch (e) { meshResult = null; }
+    if (radarOn) { drawRadar(); renderMeshTelem(); }
+  }, 700);
+}
+
+// Build the link matrix from measured + reported RSSI, solve the constellation,
+// calibrate + anchor against any GPS units. Populates `meshResult`.
+function solveMesh() {
+  const now = Date.now();
+  const meName = myName;
+
+  // 1) nodes: us + every peer (carry a GPS pos when known)
+  const nodes = [], idx = new Map();
+  const add = (name, gps) => {
+    if (idx.has(name)) { const k = idx.get(name); if (gps && !nodes[k].gps) nodes[k].gps = gps; return k; }
+    idx.set(name, nodes.length); nodes.push({ name, gps: gps || null }); return nodes.length - 1;
+  };
+  const meGps = (myGps && myGps.fix) ? { lat: +myGps.lat, lon: +myGps.lon }
+              : (myPos ? { lat: myPos.lat, lon: myPos.lon } : null);
+  add(meName, meGps);
+  for (const [name, p] of peers) add(name, p.lat !== undefined ? { lat: p.lat, lon: p.lon } : null);
+  const N = nodes.length;
+  if (N < 2) { meshResult = { mode: "none", nodeCount: N, linkCount: 0, cal: { ...rssiCal } }; return; }
+
+  // 2) RSSI links (unordered pairs), de-duplicated by averaging samples
+  const linkR = {};
+  const addLink = (a, b, rssi) => {
+    if (a === b || !idx.has(a) || !idx.has(b) || !isFinite(rssi)) return;
+    let i = idx.get(a), j = idx.get(b); if (i > j) { const t = i; i = j; j = t; }
+    (linkR[i + "|" + j] || (linkR[i + "|" + j] = [])).push(rssi);
+  };
+  for (const [name, p] of peers)                       // us -> peer (we heard them)
+    if (p.rssi !== undefined && (!p.rssiTs || now - p.rssiTs < MESH_LINK_TTL)) addLink(meName, name, +p.rssi);
+  for (const [name, p] of peers) {                     // peer -> X (they heard X)
+    if (!p.nbRaw || (p.nbTs && now - p.nbTs > MESH_LINK_TTL)) continue;
+    for (const e of p.nbRaw) {
+      const other = e.id === myBoardId ? meName : idToName.get(e.id);
+      if (other) addLink(name, other, +e.rssi);
+    }
+  }
+
+  // 3) calibrate the path-loss model from GPS-known pairs that also have a link
+  const calPairs = [];
+  for (const key in linkR) {
+    const [i, j] = key.split("|").map(Number);
+    if (nodes[i].gps && nodes[j].gps) calPairs.push({ dist: haversineM(nodes[i].gps, nodes[j].gps), rssi: meanOf(linkR[key]) });
+  }
+  const calibrated = calPairs.length >= 2;
+  rssiCal = calibrate(calPairs, rssiCal); saveCal();
+
+  // 4) distance matrix (RSSI-derived links; GPS-GPS pairs pinned exactly, heavier)
+  const dist = Array.from({ length: N }, () => Array(N).fill(NaN));
+  const w = Array.from({ length: N }, () => Array(N).fill(0));
+  let linkCount = 0;
+  for (const key in linkR) {
+    const [i, j] = key.split("|").map(Number);
+    const d = rssiToDist(meanOf(linkR[key]));
+    if (!(d > 0) || !isFinite(d)) continue;
+    dist[i][j] = dist[j][i] = d; w[i][j] = w[j][i] = 1; linkCount++;
+  }
+  for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++)
+    if (nodes[i].gps && nodes[j].gps) { const d = haversineM(nodes[i].gps, nodes[j].gps); dist[i][j] = dist[j][i] = d; w[i][j] = w[j][i] = 3; }
+  if (linkCount < 1) { meshResult = { mode: "none", nodeCount: N, linkCount: 0, cal: { ...rssiCal }, calibrated }; return; }
+
+  // 5) lay out (warm-started by name for frame-to-frame stability)
+  const init = nodes.map((nd, i) => meshWarmByName.get(nd.name) || meshSeed(1, (i + 1) * 131)[0]);
+  const X = smacof(N, dist, w, { seed: 13, iters: 300, restarts: 10, init });
+  meshWarmByName = new Map(); nodes.forEach((nd, i) => meshWarmByName.set(nd.name, { x: X[i].x, y: X[i].y }));
+
+  // 6) anchor the relative layout onto real coordinates if any unit has GPS
+  const gpsNodes = nodes.map((nd, i) => ({ i, nd })).filter(o => o.nd.gps);
+  const estimates = new Map();
+  let mode, rms = null, originLL = null, orientationKnown = true;
+  if (gpsNodes.length >= 2) {
+    originLL = gpsNodes[0].nd.gps;
+    const fit = fitSimilarity(gpsNodes.map(o => X[o.i]), gpsNodes.map(o => enuFrom(originLL, o.nd.gps)));
+    if (fit) {
+      mode = "anchored"; rms = fit.rms;
+      for (let i = 0; i < N; i++) { const enu = fit.apply(X[i]); estimates.set(nodes[i].name, { enu, ll: llFromEnu(originLL, enu), gps: !!nodes[i].gps }); }
+    } else {
+      // Degenerate anchors (e.g. GPS units at the same spot): can't orient.
+      // Fall back to translation-only so we never treat raw MDS coords as ENU.
+      const a = X[gpsNodes[0].i];
+      mode = "anchored1"; orientationKnown = false;
+      for (let i = 0; i < N; i++) { const enu = { x: X[i].x - a.x, y: X[i].y - a.y }; estimates.set(nodes[i].name, { enu, ll: llFromEnu(originLL, enu), gps: !!nodes[i].gps }); }
+    }
+  } else if (gpsNodes.length === 1) {
+    originLL = gpsNodes[0].nd.gps;
+    const a = X[gpsNodes[0].i];
+    mode = "anchored1"; orientationKnown = false;   // translation only; bearing unknown
+    for (let i = 0; i < N; i++) { const enu = { x: X[i].x - a.x, y: X[i].y - a.y }; estimates.set(nodes[i].name, { enu, ll: llFromEnu(originLL, enu), gps: !!nodes[i].gps }); }
+  } else {
+    const me = X[idx.get(meName)];
+    mode = "relative"; orientationKnown = false;
+    for (let i = 0; i < N; i++) estimates.set(nodes[i].name, { enu: { x: X[i].x - me.x, y: X[i].y - me.y }, ll: null, gps: false });
+  }
+
+  let s = 0, c = 0; for (const k in linkR) { const d = rssiToDist(meanOf(linkR[k])); if (d > 0) { s += d; c++; } }
+  const sigma = Math.max(15, rms != null ? rms : (c ? s / c : 100) * 0.25);
+  meshResult = { mode, nodeCount: N, linkCount, anchors: gpsNodes.length, rms, sigma,
+                 cal: { ...rssiCal }, calibrated, originLL, orientationKnown, estimates, meName };
+}
+
+// hollow dashed "~" marker + dashed uncertainty halo for an RSSI-estimated unit
+function drawEstNode(svg, x, y, name, sigma, scale, R) {
+  const pr = Math.min((sigma || 40) / scale, 1) * R;
+  if (pr >= 1) svg.appendChild(svgEl("circle", { cx: x, cy: y, r: pr,
+    style: "fill:var(--accent);opacity:.08;stroke:var(--accent);stroke-opacity:.35;stroke-dasharray:3 3" }));
+  svg.appendChild(svgEl("circle", { cx: x, cy: y, r: 5,
+    style: "fill:none;stroke:var(--accent);stroke-width:1.6;stroke-dasharray:2.5 2" }));
+  svg.appendChild(svgEl("text", { x, y: y - 9, "text-anchor": "middle", style: "fill:var(--muted);font-size:11px" }, name + " ~"));
+}
+
+// relative-only constellation (no unit has GPS): centre on us, orientation arbitrary
+function drawRelativeMesh(svg, C, R, label) {
+  const est = meshResult.estimates;
+  let maxD = 1; for (const [, e] of est) maxD = Math.max(maxD, Math.hypot(e.enu.x, e.enu.y));
+  const scale = niceScale(Math.max(100, maxD * 1.15));
+  svg.appendChild(svgEl("text", { x: C + 5, y: C - R + 22, style: label }, fmtDistance(scale)));
+  svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5, style: "fill:var(--accent)" }));
+  svg.appendChild(svgEl("text", { x: C, y: C - 9, "text-anchor": "middle",
+    style: "fill:var(--text);font-size:11px;font-weight:600" }, meshResult.meName));
+  for (const [nm, e] of est) {
+    if (nm === meshResult.meName) continue;
+    const d = Math.hypot(e.enu.x, e.enu.y), b = (Math.atan2(e.enu.x, e.enu.y) * 180 / Math.PI + 360) % 360;
+    const r = Math.min(d / scale, 1) * R;
+    drawEstNode(svg, C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r, nm, meshResult.sigma, scale, R);
+  }
+  els.radarMsg.textContent = `Relative layout · no GPS · orientation arbitrary · est. ring ${fmtDistance(scale)}`;
 }
 
 // Human "age" with sub-minute resolution, so a fresh value never reads "now"
@@ -667,39 +960,92 @@ function drawRadar() {
   for (const f of [0.5, 1]) svg.appendChild(svgEl("circle", { cx: C, cy: C, r: R * f, style: grid }));
   svg.appendChild(svgEl("line", { x1: C, y1: C - R, x2: C, y2: C + R, style: grid }));
   svg.appendChild(svgEl("line", { x1: C - R, y1: C, x2: C + R, y2: C, style: grid }));
-  // Compass labels sit just inside the outer ring (no wasted margin around it).
-  const compass = "fill:var(--muted);font-size:11px;font-weight:600";
-  svg.appendChild(svgEl("text", { x: C, y: C - R + 11, "text-anchor": "middle", style: compass }, "N"));
-  svg.appendChild(svgEl("text", { x: C + R - 4, y: C + 4, "text-anchor": "end", style: compass }, "E"));
-  svg.appendChild(svgEl("text", { x: C, y: C + R - 3, "text-anchor": "middle", style: compass }, "S"));
-  svg.appendChild(svgEl("text", { x: C - R + 4, y: C + 4, "text-anchor": "start", style: compass }, "W"));
+  // Compass labels (drawn only for GPS-oriented views — added after we know we
+  // aren't in the orientation-arbitrary relative-mesh branch).
+  const drawCompass = () => {
+    const compass = "fill:var(--muted);font-size:11px;font-weight:600";
+    svg.appendChild(svgEl("text", { x: C, y: C - R + 11, "text-anchor": "middle", style: compass }, "N"));
+    svg.appendChild(svgEl("text", { x: C + R - 4, y: C + 4, "text-anchor": "end", style: compass }, "E"));
+    svg.appendChild(svgEl("text", { x: C, y: C + R - 3, "text-anchor": "middle", style: compass }, "S"));
+    svg.appendChild(svgEl("text", { x: C - R + 4, y: C + 4, "text-anchor": "start", style: compass }, "W"));
+  };
 
   // expire stale peers
   expirePeers();
   const now = Date.now();
 
-  if (!myPos) {
-    els.radarMsg.textContent = "Waiting for your GPS fix…";
+  // Reference point for the relative radar. Normally that's us. When we have no
+  // fix yet, fall back to centering on a peer that does — so the other units
+  // (and the geometry between them) are still visible (Fix B).
+  const state = gpsState();
+  const fixLost = myPos && state !== "live";   // holding/lost = coasting on last known
+  const peersWithPos = [...peers.entries()].filter(([, p]) => p.lat !== undefined);
+
+  let refPos, refIsSelf, refName = null, refHacc;
+  if (myPos) {
+    refPos = myPos; refIsSelf = true; refHacc = myGps && myGps.hacc;
+  } else if (peersWithPos.length) {
+    // center on the focused peer if it has a fix, else the most recently heard
+    let pick = peersWithPos.find(([name]) => name === focusedPeer)
+            || peersWithPos.reduce((a, b) => b[1].ts > a[1].ts ? b : a);
+    refName = pick[0];
+    refPos = { lat: pick[1].lat, lon: pick[1].lon, alt: pick[1].alt };
+    refIsSelf = false; refHacc = pick[1].ext && pick[1].ext.hacc;
+  } else if (meshResult && meshResult.mode === "relative" && meshResult.estimates && meshResult.estimates.size > 1) {
+    // No unit has GPS, but the RSSI mesh gives a relative constellation (Fix B+).
+    drawRelativeMesh(svg, C, R, label);
+    return;
+  } else {
+    els.radarMsg.textContent = "Waiting for a GPS fix — peers appear here as their beacons arrive.";
     return;
   }
-  const state = gpsState();
-  const fixLost = state !== "live";   // holding/lost = coasting on last known
+  drawCompass();   // GPS-oriented view (north-up) — safe to label N/E/S/W
 
-  const plotted = [...peers.entries()]
-    .filter(([, p]) => p.lat !== undefined)
+  // everyone with a position except whoever sits at the center
+  const plotted = peersWithPos
+    .filter(([name]) => name !== refName)
     .map(([name, p]) => ({
-      name, p, d: haversineM(myPos, p), b: bearingDeg(myPos, p),
+      name, p, d: haversineM(refPos, p), b: bearingDeg(refPos, p),
     }));
-  const scale = niceScale(Math.max(100, ...plotted.map(x => x.d * 1.15)));
+  // RSSI-estimated (GPS-less) units share the auto-scale so distant estimates
+  // aren't all clamped to the outer ring (e.g. when no peer has its own GPS).
+  let maxEstD = 0;
+  if (meshResult && meshResult.estimates && (meshResult.mode === "anchored" || meshResult.mode === "anchored1")) {
+    for (const [nm, e] of meshResult.estimates) {
+      if (e.gps || !e.ll || nm === refName || (refIsSelf && nm === meshResult.meName)) continue;
+      const t = enuFrom(refPos, e.ll);
+      maxEstD = Math.max(maxEstD, Math.hypot(t.x, t.y));
+    }
+  }
+  const scale = niceScale(Math.max(100, maxEstD * 1.15, ...plotted.map(x => x.d * 1.15)));
 
   // ring distance labels (offset right of the N axis so they clear the N label)
   svg.appendChild(svgEl("text", { x: C + 5, y: C - R / 2 - 3, style: label }, fmtDistance(scale / 2)));
   svg.appendChild(svgEl("text", { x: C + 5, y: C - R + 22, style: label }, fmtDistance(scale)));
 
-  // me, at the center — dimmed when we're coasting on a lost fix
+  // Accuracy halo (Fix A): a translucent disc sized by the reported horizontal
+  // accuracy (hacc, metres), so the dot's "could be anywhere in here" is honest.
+  const accCircle = (parent, cx, cy, haccM, colorVar) => {
+    if (!(haccM > 0)) return;
+    const pr = Math.min(haccM / scale, 1) * R;
+    if (pr < 1) return;                 // sub-pixel — not worth drawing
+    parent.appendChild(svgEl("circle", { cx, cy, r: pr,
+      style: `fill:${colorVar};opacity:.12;stroke:${colorVar};stroke-opacity:.3` }));
+  };
+
+  // project a lat/lon onto the radar (clamped to the outer ring)
+  const project = pt => {
+    const d = haversineM(refPos, pt), b = bearingDeg(refPos, pt);
+    const r = Math.min(d / scale, 1) * R;
+    return [C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r];
+  };
+
+  // center: us (accent), or the reference peer (green) when we have no fix
+  const centerColor = refIsSelf ? "var(--accent)" : "var(--ok)";
+  accCircle(svg, C, C, refHacc, centerColor);
   svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5,
-    style: "fill:var(--accent)" + (fixLost ? ";opacity:.4" : "") }));
-  if (myGps && +myGps.speed > 2 && myGps.course !== undefined) {
+    style: `fill:${centerColor}` + (fixLost ? ";opacity:.4" : "") }));
+  if (refIsSelf && myGps && +myGps.speed > 2 && myGps.course !== undefined) {
     const ca = myGps.course * Math.PI / 180;
     svg.appendChild(svgEl("line", {
       x1: C + Math.sin(ca) * 6,  y1: C - Math.cos(ca) * 6,
@@ -707,13 +1053,9 @@ function drawRadar() {
       style: "stroke:var(--accent);stroke-width:2.5;stroke-linecap:round",
     }));
   }
-
-  // project a lat/lon onto the radar (clamped to the outer ring)
-  const project = pt => {
-    const d = haversineM(myPos, pt), b = bearingDeg(myPos, pt);
-    const r = Math.min(d / scale, 1) * R;
-    return [C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r];
-  };
+  if (!refIsSelf)
+    svg.appendChild(svgEl("text", { x: C, y: C - 9, "text-anchor": "middle",
+      style: "fill:var(--text);font-size:11px;font-weight:600" }, refName));
 
   for (const { name, p, d, b } of plotted) {
     const r = Math.min(d / scale, 1) * R;
@@ -733,6 +1075,7 @@ function drawRadar() {
         style: "fill:none;stroke:var(--ok);stroke-width:1.5;stroke-dasharray:3 3;opacity:.45",
       }));
     }
+    accCircle(g, x, y, p.ext && p.ext.hacc, "var(--ok)");
     g.appendChild(svgEl("circle", { cx: x, cy: y, r: 5, style: "fill:var(--ok)" }));
     // course arrow when the peer reports motion (beacon ext payload)
     if (p.ext && p.ext.speed > 2 && p.ext.course !== undefined) {
@@ -750,13 +1093,36 @@ function drawRadar() {
     svg.appendChild(g);
   }
 
-  let radarMsg = plotted.length
-    ? `Outer ring ${fmtDistance(scale)}`
-    : "Peers appear here as their messages and beacons arrive";
-  if (state === "holding")
-    radarMsg = `GPS holding ${fmtAge(now - lastFixTs)} · last known · ` + radarMsg;
-  else if (state === "lost")
-    radarMsg = `GPS lost ${fmtAge(now - lastFixTs)} · last known · ` + radarMsg;
+  // RSSI-trilateration overlay: units with no GPS of their own, placed by the
+  // mesh solve and anchored to the GPS units (hollow "~" markers + halos).
+  let estCount = 0;
+  if (meshResult && meshResult.estimates && (meshResult.mode === "anchored" || meshResult.mode === "anchored1")) {
+    for (const [nm, e] of meshResult.estimates) {
+      if (e.gps || !e.ll) continue;                 // has its own GPS dot already
+      if (nm === refName || (refIsSelf && nm === meshResult.meName)) continue;
+      const t = enuFrom(refPos, e.ll);
+      const d = Math.hypot(t.x, t.y), b = (Math.atan2(t.x, t.y) * 180 / Math.PI + 360) % 360;
+      const r = Math.min(d / scale, 1) * R;
+      drawEstNode(svg, C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r,
+                  nm, meshResult.sigma, scale, R);
+      estCount++;
+    }
+  }
+
+  let radarMsg;
+  if (!refIsSelf) {
+    radarMsg = `No local fix — centered on ${refName} · Outer ring ${fmtDistance(scale)}`;
+  } else {
+    radarMsg = plotted.length
+      ? `Outer ring ${fmtDistance(scale)}`
+      : "Peers appear here as their messages and beacons arrive";
+    if (state === "holding")
+      radarMsg = `GPS holding ${fmtAge(now - lastFixTs)} · last known · ` + radarMsg;
+    else if (state === "lost")
+      radarMsg = `GPS lost ${fmtAge(now - lastFixTs)} · last known · ` + radarMsg;
+  }
+  if (estCount) radarMsg += ` · ${estCount} est~`
+    + (meshResult.mode === "anchored1" ? " (bearing approx)" : "");
   els.radarMsg.textContent = radarMsg;
 }
 
@@ -973,6 +1339,15 @@ function buildTelemSkeleton() {
   telemEls.mineSave  = thRow(mine, "Compression", "Air-bytes saved by smaz text compression");
   telemEls.mineChan  = thRow(mine, "Noise floor", "Idle RX noise floor — lower is a quieter channel");
 
+  // Mesh positioning section (RSSI trilateration + GPS anchoring/calibration).
+  const ms = els.telemMesh;
+  ms.replaceChildren();
+  telemEls.meshHead   = thHead(ms);
+  telemEls.meshNodes  = thRow(ms, "Nodes", "Units in the mesh: you + every peer heard");
+  telemEls.meshLinks  = thRow(ms, "Links", "Pairwise radio links (yours + neighbour reports) used to triangulate");
+  telemEls.meshAnchor = thRow(ms, "Anchoring", "How the relative constellation is pinned to real coordinates");
+  telemEls.meshCal    = thRow(ms, "Calibration", "RSSI→distance model (path-loss exponent n, ref power P0). Auto-fits when ≥2 nodes have GPS.");
+
   const pp = els.telemPeer;
   pp.replaceChildren();
   telemEls.peerHead = thHead(pp);
@@ -1082,12 +1457,38 @@ function renderBrowserDynamic() {
   telemEls.brClock.textContent = new Date().toLocaleTimeString();
 }
 
+// Mesh-positioning section: stable rows, values updated in place.
+function renderMeshTelem() {
+  if (!telemEls.meshHead) return;
+  const r = meshResult;
+  const calTxt = c => c ? `n=${c.n.toFixed(2)} · P0=${Math.round(c.p0)} dBm` : DASH;
+  if (!r || r.mode === "none" || !r.nodeCount || r.nodeCount < 2 || !r.linkCount) {
+    setHead(telemEls.meshHead, "", "Mesh idle", r && r.nodeCount > 1 ? "no links yet" : "need ≥2 nodes");
+    telemEls.meshNodes.textContent = r && r.nodeCount ? `${r.nodeCount}` : DASH;
+    telemEls.meshLinks.textContent = r && r.linkCount !== undefined ? `${r.linkCount}` : DASH;
+    telemEls.meshAnchor.textContent = DASH;
+    telemEls.meshCal.textContent = calTxt(r && r.cal) + (r && r.calibrated ? " · calibrated" : " · default");
+    return;
+  }
+  const word = r.mode === "anchored" ? "Anchored to GPS"
+             : r.mode === "anchored1" ? "Anchored · 1 ref" : "Relative only";
+  const cls = r.mode === "anchored" ? "good" : "warn";
+  setHead(telemEls.meshHead, cls, word, `±${Math.round(r.sigma)} m est`);
+  telemEls.meshNodes.textContent = `${r.nodeCount}`;
+  telemEls.meshLinks.textContent = `${r.linkCount}`;
+  telemEls.meshAnchor.textContent =
+      r.mode === "anchored"  ? `${r.anchors} GPS refs · fit rms ±${Math.round(r.rms)} m`
+    : r.mode === "anchored1" ? "1 GPS ref · position only, bearing unknown"
+    :                          "no GPS · orientation arbitrary";
+  telemEls.meshCal.textContent = calTxt(r.cal) + (r.calibrated ? " · calibrated" : " · default");
+}
+
 function renderTelemetry() {
   if (!radarOn) return;
   buildTelemSkeleton();
   renderBrowserDynamic();
+  renderMeshTelem();
   const now = Date.now();
-
   // --- my board: same rows every time; missing data shows "—" ---
   const m = myGps;
   const state = gpsState();
@@ -1519,6 +1920,7 @@ async function writeLine(obj) {
 function handleBoardEvent(m) {
   switch (m.t) {
     case "ready":
+      if (m.id !== undefined) myBoardId = m.id;   // our senderId, for the mesh matrix
       if (!connected) {
         // A labeled board (e.g. "solar") owns its name: adopt it and don't
         // bother trying to override it.
@@ -1539,7 +1941,7 @@ function handleBoardEvent(m) {
       break;
     case "rx":
       addMessage({ mine: false, from: m.from, text: m.text, rssi: m.rssi, snr: m.snr, pos: m.pos });
-      notePeer(m.from, m.pos, m.rssi, m.snr);
+      notePeer(m.from, m.pos, m.rssi, m.snr, undefined, undefined, m.id);
       updateLink(m.rssi, m.snr);
       notifyIncoming();
       break;
@@ -1548,12 +1950,12 @@ function handleBoardEvent(m) {
       const where = describePeerPos(m.pos);
       if (where) line += `  ·  ${where}`;
       addSystem(line);
-      notePeer(m.from, m.pos, m.rssi, m.snr, undefined, m.client);
+      notePeer(m.from, m.pos, m.rssi, m.snr, undefined, m.client, m.id);
       updateLink(m.rssi, m.snr);
       break;
     }
     case "beacon":   // periodic position broadcast — silent, feeds radar/roster/telemetry
-      notePeer(m.from, m.pos, m.rssi, m.snr, m.ext);
+      notePeer(m.from, m.pos, m.rssi, m.snr, m.ext, undefined, m.id, m.nb);
       updateLink(m.rssi, m.snr);
       break;
     case "gps":
@@ -1565,6 +1967,7 @@ function handleBoardEvent(m) {
       // Keep the last good fix through brief dropouts instead of blanking.
       if (m.fix) { myPos = { lat: m.lat, lon: m.lon, alt: m.alt }; myPosTs = Date.now(); lastFixTs = Date.now(); }
       updateGpsPill();
+      scheduleMeshSolve();   // our position feeds calibration + anchoring
       if (radarOn) drawRadar();
       drawRoster();   // distances depend on our own position
       renderTelemetry();

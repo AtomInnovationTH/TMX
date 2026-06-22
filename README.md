@@ -1,6 +1,6 @@
 # 💬 LoRa Chat — off-grid browser chat with two LightTrackers
 
-**Version:** firmware **v1.6** · 923.2 MHz (AS923 Thailand)
+**Version:** firmware **v1.7** · 923.2 MHz (AS923 Thailand)
 
 **Open the chat app:** **https://atominnovationth.github.io/TMX/**
 *(enable Pages once: repo Settings → Pages → branch `main`, folder `/docs`)*
@@ -16,6 +16,11 @@ board, announces you to everyone in radio range, and you're chatting.
 - **Direction finder**: every message carries the sender's GPS position — the app
   shows live **distance and compass bearing** to the other person
   (`📍 4.2 km NNE ↗`), altitude difference, and their battery voltage
+- **Mesh positioning** (fw 1.7): boards rebroadcast the signal strength of the
+  peers they hear, so the app can triangulate a unit that has **no GPS of its
+  own** from radio link strength, then pin that relative map onto real
+  coordinates whenever any unit does have GPS (and auto-calibrate the
+  distance model). Shown as hollow "~" markers with uncertainty halos.
 - Clean light/dark chat UI, join announcements, unplug/reconnect handling
 
 ## <a name="chat-setup"></a>Chat quick start
