@@ -9,23 +9,30 @@
 //                      {"t":"client","v":"Chrome 126 · macOS · desktop"}
 //                      {"t":"join"}
 //                      {"t":"tx","id":7,"text":"hello"}
-//   board -> browser : {"t":"ready","fw":"1.7","freq":923.2,"name":"Joi","id":4321}
+//   board -> browser : {"t":"ready","fw":"1.8","freq":923.2,"name":"Joi","id":4321}
 //                      {"t":"rx","from":"Mai","id":2048,"text":"hi","rssi":-42,"snr":12.5}
 //                      {"t":"join","from":"Mai","id":2048,"rssi":-42,"snr":12.5,
 //                       "client":"Edge · Windows · desktop"}
 //                      {"t":"beacon","from":"Mai","id":2048,"rssi":-42,"snr":12.5,
-//                       "pos":{...},"ext":{"speed":4,"course":120,"hacc":4,"fixType":3},
+//                       "pos":{...},"ext":{"speed":4,"course":120,"hacc":4,"fixType":3,
+//                       "temp":31,"press":1008.4,"hdg":210},
 //                       "nb":[{"id":4321,"rssi":-55},{"id":7777,"rssi":-88}]}
 //                       id  = sender's per-boot senderId (fw 1.7+; lets the app
 //                             map names<->ids for mesh trilateration).
 //                       nb  = neighbours the sender currently hears + their RSSI
 //                             (fw 1.7+), so one connected board can recover the
 //                             whole pairwise link matrix, not just its own row.
+//                       ext.temp/press/hdg = board environment (fw 1.8+): BMP180
+//                             board temp °C + pressure hPa, magnetic heading deg
+//                             (each omitted when the sensor is absent/invalid).
 //                      {"t":"gps",...,"sats":11,"siv":14,"speed":4.2,
 //                       "course":118,"fixType":3,"hacc":3.8,"pdop":1.6,
-//                       "utc":"2026-06-13T06:40:12Z",
-//                       "up":120,"noise":-104.5,"tx":3,"rx":2,"csave":47}
+//                       "utc":"2026-06-13T06:40:12Z","temp":31.2,"press":1008.4,
+//                       "hdg":210,"up":120,"noise":-104.5,"tx":3,"rx":2,"csave":47}
 //                       sats=used in fix (0=no fix); siv=satellites in view.
+//                       temp=board °C, press=hPa (BMP180, fw 1.8+, omitted if
+//                       absent); hdg=magnetic heading deg (fw 1.8+, omitted until
+//                       the compass self-calibrates by being rotated once).
 //                      {"t":"sent","id":7}        radio TX completed
 //                      {"t":"ack","id":7}         remote board confirmed receipt
 //                      {"t":"err","msg":"..."}
@@ -55,9 +62,17 @@
 //                   fw 1.5+ also sends ONE beacon on boot (every board) as a
 //                   presence/power ping, and labeled boards beacon autonomously.
 //                   fw 1.7+ appends a neighbour block after the 4 ext bytes:
-//                   [count:u8][ {senderId:2 LE}{rssi:i8 dBm} x count ] (up to 6,
+//                   [count:u8][ {senderId:2 LE}{rssi:i8} x count ] (up to 6,
 //                   freshest first). Older boards read only the 4 ext bytes and
 //                   ignore the rest; new boards decode it into the `nb` event.
+//                   fw 1.8+ appends 4 environment bytes AFTER the neighbour
+//                   block: [temp:i8 °C (-128=invalid)][press:u16 LE hPa*10
+//                   (0=invalid)][hdg:u8 deg/2 (255=invalid)]. Receivers parse
+//                   them only when payloadLen >= nbEnd+4, so 1.7<->1.8 fleets
+//                   mix cleanly (env data is just absent from a 1.7 sender).
+//                   fw 1.8+ also beacons every ~60 s once joined WHETHER OR NOT
+//                   a GPS fix is held (presence heartbeat: name+battery+temp
+//                   still report with sats=0), so silence is meaningful.
 //   trailer (when type bit7 set, appended after payload):
 //           [lat:i32 deg*1e7][lon:i32 deg*1e7][alt:i16 m][sats:u8][batt:u8 V*20]
 //
@@ -68,6 +83,7 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_BMP085.h>
 #include "SparkFun_Ublox_Arduino_Library.h"
 #include "smaz.h"
 
@@ -86,6 +102,31 @@ bool displayOK = false;
 #define BattPin A5
 SFE_UBLOX_GPS myGPS;
 bool gpsOK = false;
+
+// ---------- Onboard environment sensors (fw 1.8) ----------
+// BMP180 barometer/thermometer (I2C 0x77) — board temperature + pressure. The
+// original tracker firmware reads it via this same vendored library. Reading is
+// blocking (~10-30 ms) but happens only in the 2 s poll, so it never touches an
+// ACK window. Non-fatal: if the chip is absent, bmpOK stays false and the temp/
+// pressure fields are simply omitted (same pattern as gpsOK/displayOK).
+Adafruit_BMP085 bmp;
+bool     bmpOK = false;
+int16_t  myTempC10 = 0;      // board temperature, °C * 10 (valid when bmpOK)
+uint32_t myPressPa = 0;      // barometric pressure, Pa (valid when bmpOK)
+
+// LSM303DLHC magnetometer (I2C 0x1E) — an approximate magnetic heading. There is
+// no vendored driver, so this is a tiny raw-Wire implementation (see magInit/
+// magRead). Hard-iron offset is auto-calibrated in RAM only: we track the min/max
+// of each axis as the board is turned, and the heading is only reported once the
+// board has been rotated enough this power-on (spread > threshold). No tilt
+// compensation, no declination — it is labelled "magnetic · approx" in the UI.
+static const uint8_t MAG_ADDR = 0x1E;
+bool     magOK = false;
+int16_t  magMinX = 32767, magMaxX = -32768;
+int16_t  magMinY = 32767, magMaxY = -32768;
+uint16_t myHdgDeg = 0;       // magnetic heading, degrees (valid when hdgValid)
+bool     hdgValid = false;
+static const int16_t MAG_CAL_SPREAD = 150;   // per-axis min/max span needed to trust the heading
 
 // ---------- Radio settings (must match on both boards) ----------
 static const float    LORA_FREQ      = 923.2f; // AS923 (Thailand 920-925 MHz)
@@ -225,8 +266,62 @@ float readBattVolts() {
   return v;
 }
 
+// ---------- LSM303DLHC magnetometer (raw Wire, fw 1.8) ----------
+// The mag block sits at its own I2C address (0x1E); registers of interest:
+//   CRA_REG_M 0x00 = 0x10 -> 15 Hz output      CRB_REG_M 0x01 = 0x20 -> ±1.3 Ga
+//   MR_REG_M  0x02 = 0x00 -> continuous mode    IRA_REG_M 0x0A reads 0x48 ('H')
+// Data at 0x03 is big-endian in the quirky X, Z, Y order.
+bool magInit() {
+  Wire.beginTransmission(MAG_ADDR);
+  Wire.write(0x0A);                                  // IRA_REG_M identity register
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((int)MAG_ADDR, 1) != 1) return false;
+  if (Wire.read() != 0x48) return false;             // not an LSM303DLHC mag
+  const uint8_t cfg[3][2] = { {0x00, 0x10}, {0x01, 0x20}, {0x02, 0x00} };
+  for (uint8_t i = 0; i < 3; i++) {
+    Wire.beginTransmission(MAG_ADDR);
+    Wire.write(cfg[i][0]); Wire.write(cfg[i][1]);
+    if (Wire.endTransmission() != 0) return false;
+  }
+  return true;
+}
+
+// Read one sample, feed the running hard-iron min/max, and recompute the heading.
+// hdgValid flips true only once the board has been rotated enough this power-on
+// (both axes have swept > MAG_CAL_SPREAD counts), so a still board never emits a
+// bogus fixed heading.
+void magRead() {
+  if (!magOK) return;
+  Wire.beginTransmission(MAG_ADDR);
+  Wire.write(0x03);                                  // OUT_X_H_M (auto-increments)
+  if (Wire.endTransmission() != 0) return;
+  if (Wire.requestFrom((int)MAG_ADDR, 6) != 6) return;
+  uint8_t b[6];
+  for (uint8_t i = 0; i < 6; i++) b[i] = Wire.read();   // read in a defined order
+  int16_t x = (int16_t)((b[0] << 8) | b[1]);            // X (H,L); b[2..3]=Z, unused
+  int16_t y = (int16_t)((b[4] << 8) | b[5]);            // Y (H,L). No tilt comp, so Z
+                                                        // is intentionally not decoded.
+  if (x < magMinX) magMinX = x; if (x > magMaxX) magMaxX = x;
+  if (y < magMinY) magMinY = y; if (y > magMaxY) magMaxY = y;
+  if (magMaxX - magMinX < MAG_CAL_SPREAD || magMaxY - magMinY < MAG_CAL_SPREAD) {
+    hdgValid = false;
+    return;
+  }
+  float xc = x - (magMinX + magMaxX) / 2.0f;         // hard-iron corrected
+  float yc = y - (magMinY + magMaxY) / 2.0f;
+  float h = atan2f(yc, xc) * 57.29578f;              // rad -> deg
+  if (h < 0) h += 360.0f;
+  myHdgDeg = (uint16_t)(h + 0.5f) % 360;
+  hdgValid = true;
+}
+
 void pollGps() {
   myBatt = (uint8_t)(readBattVolts() * 20.0f);
+  if (bmpOK) {
+    myTempC10 = (int16_t)lroundf(bmp.readTemperature() * 10.0f);
+    myPressPa = (uint32_t)bmp.readPressure();        // Pa
+  }
+  magRead();
   if (!gpsOK) return;
   if (!myGPS.getPVT(250)) {
     // Transient I2C/poll timeout: tolerate a few missed polls (keep the last
@@ -269,7 +364,7 @@ void pollGps() {
 
 // Own-position + board telemetry event for the browser
 void emitGps() {
-  StaticJsonDocument<512> d;
+  StaticJsonDocument<640> d;   // rich fix + fw1.8 temp/press/hdg fields
   d["t"] = "gps";
   d["fix"] = (mySats > 0);
   d["sats"] = mySats;
@@ -290,6 +385,11 @@ void emitGps() {
              myYear, myMonth, myDay, myHour, myMin, mySec);
     d["utc"] = utc;
   }
+  if (bmpOK) {
+    d["temp"]  = serialized(String(myTempC10 / 10.0f, 1));   // board °C
+    d["press"] = serialized(String(myPressPa / 100.0f, 1));  // Pa -> hPa
+  }
+  if (hdgValid) d["hdg"] = myHdgDeg;                          // magnetic heading, deg
   d["batt"] = serialized(String(myBatt / 20.0f, 2));
   d["up"] = millis() / 1000;
   d["noise"] = serialized(String(lora.getRSSIInst(), 1));   // idle-RX noise floor
@@ -321,7 +421,7 @@ void onDio1(void) {
 void emitReady() {
   StaticJsonDocument<160> d;
   d["t"] = "ready";
-  d["fw"] = "1.7";
+  d["fw"] = "1.8";
   d["freq"] = LORA_FREQ;
   d["name"] = myName;
   d["id"] = myId;
@@ -358,7 +458,9 @@ void refreshDisplay() {
   display.print(F("TX:")); display.print(txCount);
   display.print(F(" RX:")); display.print(rxCount);
   display.print(F(" S:")); display.print(mySats);
-  display.print(F(" ")); display.print(myBatt / 20.0f, 1); display.println(F("V"));
+  display.print(F(" ")); display.print(myBatt / 20.0f, 1); display.print(F("V"));
+  if (bmpOK) { display.print(F(" ")); display.print(myTempC10 / 10); display.print(F("C")); }
+  display.println();
   if (lastFrom[0]) {
     display.print(F("From ")); display.print(lastFrom);
     display.print(F(" ")); display.print((int)lastRSSI); display.println(F("dBm"));
@@ -578,7 +680,7 @@ void handleRadioPacket() {
 
   } else if (type == TYPE_BEACON) {
     if (duplicate || !hasPos) return;
-    StaticJsonDocument<768> d;   // headroom for pos + ext + up to 6 nb entries
+    StaticJsonDocument<896> d;   // pos + ext (incl. fw1.8 env) + up to 6 nb entries
     d["t"] = "beacon";
     d["from"] = from;
     d["id"] = sender;
@@ -592,26 +694,49 @@ void handleRadioPacket() {
       pos["alt"] = pAlt;
     }
     pos["batt"] = serialized(String(pBatt / 20.0f, 2));
+    // fw 1.7+ neighbour block sits after the 4 ext bytes; fw 1.8+ env bytes sit
+    // after the nb block. Compute that boundary ONCE and reuse it for both the
+    // env decode and the nb-array decode so the two offsets can never drift.
+    uint8_t nbCountRx = 0;
+    size_t  nbEnd = 5;                 // first byte after the nb block
+    bool    haveNb = false;
+    if (payloadLen >= 5) {
+      nbCountRx = payload[4];
+      if (nbCountRx > 0 && payloadLen >= (size_t)(5 + nbCountRx * 3)) {
+        nbEnd = 5 + nbCountRx * 3;
+        haveNb = true;
+      }
+    }
     if (payloadLen >= 4) {            // fw 1.3+ extended beacon payload
       JsonObject ext = d.createNestedObject("ext");
       ext["speed"]   = payload[0];          // km/h
       ext["course"]  = payload[1] * 2;      // deg
       ext["hacc"]    = payload[2];          // m
       ext["fixType"] = payload[3];
-    }
-    // fw 1.7+ neighbour block: [count][ {id:2}{rssi:i8} x count ]
-    if (payloadLen >= 5) {
-      uint8_t nb = payload[4];
-      if (nb > 0 && payloadLen >= (size_t)(5 + nb * 3)) {
-        JsonArray arr = d.createNestedArray("nb");
-        for (uint8_t i = 0; i < nb; i++) {
-          const uint8_t* e = payload + 5 + i * 3;
-          JsonObject o = arr.createNestedObject();
-          o["id"]   = (uint16_t)(e[0] | (e[1] << 8));
-          o["rssi"] = (int8_t)e[2];
-        }
+      // fw 1.8+ environment bytes after the nb block. Only decode when the nb
+      // block is well-formed (or absent) AND the frame is long enough; a 1.7
+      // sender simply has no bytes there → fields omitted.
+      if ((haveNb || nbCountRx == 0) && payloadLen >= nbEnd + 4) {
+        const uint8_t* ev = payload + nbEnd;
+        int8_t   t   = (int8_t)ev[0];
+        uint16_t p10 = ev[1] | (ev[2] << 8);
+        uint8_t  h   = ev[3];
+        if (t != -128) ext["temp"]  = t;                               // °C
+        if (p10 != 0)  ext["press"] = serialized(String(p10 / 10.0f, 1)); // hPa
+        if (h != 255)  ext["hdg"]   = (int)h * 2;                       // deg
       }
     }
+    // fw 1.7+ neighbour block: [count][ {id:2}{rssi:i8} x count ]
+    if (haveNb) {
+      JsonArray arr = d.createNestedArray("nb");
+      for (uint8_t i = 0; i < nbCountRx; i++) {
+        const uint8_t* e = payload + 5 + i * 3;
+        JsonObject o = arr.createNestedObject();
+        o["id"]   = (uint16_t)(e[0] | (e[1] << 8));
+        o["rssi"] = (int8_t)e[2];
+      }
+    }
+    if (d.overflowed()) return;   // dropped fields would corrupt mesh/telemetry
     serializeJson(d, SerialUSB);
     SerialUSB.println();
   }
@@ -752,7 +877,7 @@ void checkAckRetry() {
 void sendBeacon() {
   long kmh = mySpeedMms > 0 ? (mySpeedMms * 9L) / 2500L : 0;   // mm/s -> km/h
   uint32_t haccM = myHaccMm / 1000;
-  uint8_t pl[4 + 1 + NB_REPORT_MAX * 3];
+  uint8_t pl[4 + 1 + NB_REPORT_MAX * 3 + 4];   // ext + nb block + fw1.8 env bytes
   pl[0] = (uint8_t)(kmh > 255 ? 255 : kmh);
   pl[1] = (uint8_t)(myCourseDeg / 2);
   pl[2] = (uint8_t)(haccM > 255 ? 255 : haccM);
@@ -769,6 +894,19 @@ void sendBeacon() {
     n++;
   }
   pl[4] = n;
+  // fw 1.8 environment trailer: board temp, pressure, magnetic heading. Sentinels
+  // (-128 / 0 / 255) mark "sensor absent or not yet calibrated"; a 1.7 receiver
+  // never reads these bytes, a 1.8 receiver skips the sentinels.
+  int8_t tByte = bmpOK ? (int8_t)constrain((myTempC10 + (myTempC10 >= 0 ? 5 : -5)) / 10,
+                                           -127L, 127L)
+                       : (int8_t)-128;
+  uint16_t p10 = 0;
+  if (bmpOK) { uint32_t v = (myPressPa + 5) / 10; p10 = v > 65535 ? 65535 : (uint16_t)v; }
+  uint8_t hByte = hdgValid ? (uint8_t)(myHdgDeg / 2) : 255;
+  pl[off++] = (uint8_t)tByte;
+  pl[off++] = p10 & 0xFF;
+  pl[off++] = p10 >> 8;
+  pl[off++] = hByte;
   uint8_t frame[MAX_FRAME];
   size_t len = buildFrame(frame, TYPE_BEACON, ++txMsgId, pl, off, true, false);
   transmitFrame(frame, len);
@@ -808,6 +946,11 @@ void setup() {
     myGPS.setI2COutput(COM_TYPE_UBX);
     myGPS.setNavigationFrequency(2);
   }
+
+  // Environment sensors (optional — fw 1.8). Both are non-fatal: a missing chip
+  // just omits its telemetry fields, exactly like gpsOK/displayOK.
+  bmpOK = bmp.begin();                // BMP180 temp/pressure (I2C 0x77)
+  magOK = magInit();                  // LSM303DLHC magnetometer (I2C 0x1E)
 
   // Radio — field-verified LightTracker settings
   int16_t state = lora.begin();
@@ -870,12 +1013,14 @@ void loop() {
     refreshDisplay();
   }
 
-  // Periodic position beacon. A browser-driven board beacons only with a fix; a
-  // standalone labeled board (nameLocked) also beacons WITHOUT a fix so its
-  // presence + battery are reported (position is added once it locks). Never
-  // while an ack is pending (don't trample a chat retransmit window).
-  // transmitFrame does CAD listen-before-talk; jitter desyncs two boards.
-  if (hasJoined && (mySats > 0 || nameLocked) && !pendingActive && now >= nextBeaconAt) {
+  // Periodic presence beacon (fw 1.8). Once joined, EVERY board beacons ~60 s
+  // whether or not it holds a GPS fix — the trailer still carries name, battery
+  // and (fw 1.8) temperature with sats=0, so a fixless board is still "alive" on
+  // the roster and going silent becomes a trustworthy signal. Position is added
+  // whenever a fix is held. Never while an ack is pending (don't trample a chat
+  // retransmit window). transmitFrame does CAD listen-before-talk; jitter
+  // desyncs two boards.
+  if (hasJoined && !pendingActive && now >= nextBeaconAt) {
     nextBeaconAt = now + BEACON_MS + random(0, 8000);
     sendBeacon();
   }

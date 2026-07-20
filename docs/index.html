@@ -256,6 +256,17 @@
   .tgaugewrap { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
   .tgaugeval { font-size: 13px; }
 
+  /* Collapsible telemetry detail (mesh detail rows, "This device" section). The
+     visible summary keeps the section glanceable; the rest folds away. */
+  #telemetry details { margin: 0; }
+  #telemetry summary { cursor: pointer; outline: none; }
+  #telemetry summary::-webkit-details-marker { color: var(--muted); }
+  #telemetry summary.detsum {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .5px; color: var(--muted); opacity: .75; padding: 2px 0;
+  }
+  #telemetry summary .theadline { display: inline-flex; margin: 2px 0; }
+
   /* Telemetry headline: a friendly summary line with a CONSTANT style. State is
      conveyed by the small status dot, not by recoloring/resizing this line. */
   .theadline {
@@ -308,7 +319,7 @@
 <div id="chat">
   <div id="left">
     <header>
-      <h1>LoRaChat <small id="subtitle">923.2 MHz</small></h1>
+      <h1>LoRaChat v1.8 <small id="subtitle">923.2 MHz</small></h1>
       <span class="pill" id="gpspill" title="Your LightTracker's GPS">GPS —</span>
       <span class="pill" id="linkpill" title="Signal strength of the last received message">▂</span>
       <span class="pill"><span class="dot" id="dot"></span><span id="status">Disconnected</span></span>
@@ -381,6 +392,12 @@ let lastFixTs = 0;  // when we last had a live fix (for the holding/lost grace)
 let myGps = null;   // full last "gps" event from the board (telemetry panel)
 const battHist = [];             // [{t, v}] own battery, ~10 min window
 const BATT_HIST_MS = 10 * 60000;
+const pressHist = [];            // [{t, v}] own barometric pressure, ~60 min window
+const PRESS_HIST_MS = 60 * 60000;
+// The uncalibrated magnetometer + a nearby USB cable can read garbage on the
+// bench. If a build proves the heading unreliable, flip this to false to keep
+// transmitting the byte but hide every heading render (radar tick + Facing row).
+const SHOW_HEADING = true;
 const bubblesById = new Map();   // webMsgId -> {meta, time, text, done} for ✓/retry
 const ackTimers = new Map();     // webMsgId -> failure timeout
 const ACK_FAIL_MS = 12000;       // board acks within ~5 s incl. its own retry
@@ -488,7 +505,18 @@ function updateGpsPill() {
   }
   if (low) { els.gpspill.textContent += " · 🔋⚠"; els.gpspill.title += ` · LOW BATTERY ${m.batt} V`; }
   els.gpspill.classList.toggle("lowbatt", !!low);
+  // Click-to-copy own coordinates when we have a (last-known) fix.
+  els.gpspill.style.cursor = myPos ? "pointer" : "";
+  if (myPos) els.gpspill.title += " · click to copy coordinates";
 }
+// One-time: copy own coordinates to the clipboard when the GPS pill is clicked.
+els.gpspill.addEventListener("click", () => {
+  if (!myPos || !navigator.clipboard) return;
+  navigator.clipboard.writeText(`${myPos.lat.toFixed(7)},${myPos.lon.toFixed(7)}`);
+  const prev = els.gpspill.textContent;
+  els.gpspill.textContent = "GPS copied ✓";
+  setTimeout(() => { if (els.gpspill.textContent === "GPS copied ✓") els.gpspill.textContent = prev; }, 1000);
+});
 
 // ---------- Geo helpers ----------
 function haversineM(a, b) {
@@ -548,6 +576,27 @@ let radarOn = localStorage.getItem("lorachat.radar") !== "0";  // right column o
 const SVGNS = "http://www.w3.org/2000/svg";
 const PEER_TTL_MS = 15 * 60000;   // drop peers not heard from in 15 min
 const TRAIL_MAX = 20;             // breadcrumb points kept per peer
+// Presence heartbeat is ~60 s + jitter, so silence is meaningful (fw 1.8):
+const OVERDUE_MS = 150000;        // 2.5 min — roster/headline turn amber "overdue"
+const QUIET_MS   = 300000;        // 5 min — one "gone quiet" system line + status
+const POS_STALE_MS = 120000;      // position ≥2 min behind presence → "pos X old"
+const PEER_TREND_MS = 10 * 60000; // per-peer battery/temp trend window
+const REBOOT_QUIET_MS = 30000;    // a boot beacon after this much silence = "rebooted"
+
+// Append {t,v} to a bounded trend ring and drop points older than PEER_TREND_MS.
+function pushTrend(arr, v, t) {
+  if (!arr) return;
+  arr.push({ t, v });
+  while (arr.length && t - arr[0].t > PEER_TREND_MS) arr.shift();
+}
+// Generic trend arrow: needs minSpanMs of data, ± delta to call a direction.
+function trendArrow(hist, minSpanMs, delta) {
+  if (!hist || hist.length < 2) return "";
+  const span = hist[hist.length - 1].t - hist[0].t;
+  if (span < minSpanMs) return "";
+  const dv = hist[hist.length - 1].v - hist[0].v;
+  return dv >= delta ? " ↗" : dv <= -delta ? " ↘" : "";
+}
 
 // Mesh trilateration (fw 1.7): our board's per-boot senderId, a senderId->name
 // directory learned from events, and the latest constellation solve.
@@ -558,17 +607,46 @@ let meshSolveTimer = null;
 let meshWarmByName = new Map();   // warm-start coords keyed by node name
 
 function notePeer(from, pos, rssi, snr, ext, client, id, nb) {
-  const p = peers.get(from) || { trail: [] };
-  p.ts = Date.now();
-  if (rssi !== undefined) { p.rssi = rssi; p.snr = snr; p.rssiTs = Date.now(); }
-  if (ext) p.ext = ext;
+  const p = peers.get(from) || { trail: [], battHist: [], tempHist: [] };
+  const now = Date.now();
+  const prevTs = p.ts || 0;
+  const wasAlerted = !!p.alerted;
+  p.ts = now;
+  if (rssi !== undefined) { p.rssi = rssi; p.snr = snr; p.rssiTs = now; }
+  if (ext) {
+    p.ext = ext;
+    if (ext.temp !== undefined) { p.temp = +ext.temp; pushTrend(p.tempHist, +ext.temp, now); }
+    if (ext.press !== undefined) p.press = +ext.press;
+    if (ext.hdg !== undefined) p.hdg = +ext.hdg;   // keep last known heading
+  }
   if (client) p.client = client;
-  if (id !== undefined) { p.id = id; idToName.set(id, from); }
-  if (nb) { p.nbRaw = nb; p.nbTs = Date.now(); }   // peers THIS node currently hears
+  // Peer reboot detection: senderId is random per power-on (fw 1.7+), so a changed
+  // id for the same name means the board power-cycled — the brown-out signal
+  // HANDOFF.md describes. One system line + a session restart counter.
+  let rebooted = false;
+  if (id !== undefined) {
+    if (p.id !== undefined && p.id !== id) {
+      p.reboots = (p.reboots || 0) + 1;
+      rebooted = true;
+      addSystem(`${from} restarted — possible power loss`
+                + (prevTs && now - prevTs > REBOOT_QUIET_MS
+                   ? ` (after ${fmtAge(now - prevTs, true)} silent)` : ""));
+    }
+    p.id = id; idToName.set(id, from);
+  }
+  // Recovery: we had flagged this peer "gone quiet" and now heard it again. A
+  // reboot line already implies it's back, so don't double-announce.
+  if (wasAlerted) {
+    if (!rebooted) addSystem(`${from} is back — silent for ${fmtAge(now - prevTs)}`);
+    p.alerted = false;
+  }
+  if (nb) { p.nbRaw = nb; p.nbTs = now; }   // peers THIS node currently hears
   if (pos) {
     p.batt = pos.batt;
     p.sats = pos.sats;
+    if (pos.batt > 0.5) pushTrend(p.battHist, +pos.batt, now);
     if (pos.sats > 0) {
+      p.posTs = now;   // freshness of the POSITION, separate from p.ts (last heard)
       if (p.lat !== undefined && (p.lat !== pos.lat || p.lon !== pos.lon)) {
         p.trail.push({ lat: p.lat, lon: p.lon });
         if (p.trail.length > TRAIL_MAX) p.trail.shift();
@@ -600,6 +678,32 @@ function focusPeer(name) {
 function expirePeers() {
   const now = Date.now();
   for (const [name, p] of peers) if (now - p.ts > PEER_TTL_MS) peers.delete(name);
+}
+
+// Presence watchdog, driven by the 10 s tick. With the fw 1.8 heartbeat every
+// board beacons ~60 s whether or not it has a fix, so prolonged silence is a
+// real "unit went down" signal. Emits at most one "gone quiet" line per silence
+// episode (cleared + a "is back" line when it returns, in notePeer) and one
+// low-battery crossing line per peer per session (hysteresis on recovery).
+function checkPeerAlerts() {
+  const now = Date.now();
+  for (const [name, p] of peers) {
+    const silent = now - p.ts;
+    if (silent > QUIET_MS && !p.alerted) {
+      p.alerted = true;
+      const bits = [];
+      if (p.batt > 0.5) bits.push(`${p.batt} V`);
+      if (p.rssi !== undefined) bits.push(`${p.rssi} dBm`);
+      addSystem(`${name} has gone quiet — last heard ${fmtAge(silent)}`
+                + (bits.length ? ` (last ${bits.join(", ")})` : ""));
+    }
+    if (p.batt > 0.5 && p.batt <= 4.3 && p.batt < LOW_BATT_V && !p.lowBattNotified) {
+      p.lowBattNotified = true;
+      addSystem(`${name} battery low — ${p.batt} V`);
+    } else if (p.batt >= LOW_BATT_V + 0.1) {
+      p.lowBattNotified = false;   // recovered (with hysteresis) — allow a future alert
+    }
+  }
 }
 
 // ======================================================================
@@ -854,14 +958,17 @@ function solveMesh() {
 }
 
 // hollow dashed "~" marker + dashed uncertainty halo for an RSSI-estimated unit
-function drawEstNode(svg, x, y, name, sigma, scale, R, color) {
+function drawEstNode(svg, x, y, name, sigma, scale, R, color, tip) {
   const c = color || "var(--accent)";
   const pr = Math.min((sigma || 40) / scale, 1) * R;
-  if (pr >= 1) svg.appendChild(svgEl("circle", { cx: x, cy: y, r: pr,
+  const g = svgEl("g", {});
+  if (tip) g.appendChild(svgEl("title", {}, tip));
+  if (pr >= 1) g.appendChild(svgEl("circle", { cx: x, cy: y, r: pr,
     style: `fill:${c};opacity:.08;stroke:${c};stroke-opacity:.35;stroke-dasharray:3 3` }));
-  svg.appendChild(svgEl("circle", { cx: x, cy: y, r: 5,
+  g.appendChild(svgEl("circle", { cx: x, cy: y, r: 5,
     style: `fill:none;stroke:${c};stroke-width:1.6;stroke-dasharray:2.5 2` }));
-  svg.appendChild(svgEl("text", { x, y: y - 9, "text-anchor": "middle", style: "fill:var(--muted);font-size:11px" }, name + " ~"));
+  g.appendChild(svgEl("text", { x, y: y - 9, "text-anchor": "middle", style: "fill:var(--muted);font-size:11px" }, name + " ~"));
+  svg.appendChild(g);
 }
 
 // relative-only constellation (no unit has GPS): centre on us, orientation arbitrary
@@ -878,7 +985,8 @@ function drawRelativeMesh(svg, C, R, label) {
     const d = Math.hypot(e.enu.x, e.enu.y), b = (Math.atan2(e.enu.x, e.enu.y) * 180 / Math.PI + 360) % 360;
     const r = Math.min(d / scale, 1) * R;
     drawEstNode(svg, C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r,
-                nm, meshResult.sigma, scale, R, nodeColor(nm, false));
+                nm, meshResult.sigma, scale, R, nodeColor(nm, false),
+                (peers.has(nm) ? radarTipFor(nm, peers.get(nm)) : nm) + " · RSSI estimate");
   }
   els.radarMsg.textContent = `Relative layout · no GPS · orientation arbitrary · est. ring ${fmtDistance(scale)}`;
 }
@@ -906,7 +1014,7 @@ function drawRoster() {
   const focused = focusedTarget();
   for (const [name, p] of peers) {
     const chip = document.createElement("div");
-    chip.className = "chip" + (now - p.ts > 120000 ? " stale" : "")
+    chip.className = "chip" + (now - p.ts > OVERDUE_MS ? " stale" : "")
                    + (name === focused ? " focused" : "");
     chip.addEventListener("click", () => focusPeer(name));
     const sw = document.createElement("span");   // colour swatch = this board's radar/avatar colour
@@ -925,7 +1033,11 @@ function drawRoster() {
     } else if (p.lat !== undefined) {
       bits.push("📍 has fix");
     }
-    bits.push(fmtAge(now - p.ts));
+    bits.push(now - p.ts > QUIET_MS ? `quiet ${fmtAge(now - p.ts)}` : fmtAge(now - p.ts));
+    // Position age is separate from last-heard: a fixless-but-beaconing peer is
+    // "alive" yet its last position is old — say so instead of implying it's fresh.
+    if (p.posTs && p.ts - p.posTs > POS_STALE_MS)
+      bits.push(`pos ${fmtAge(now - p.posTs, true)} old`);
     sub.textContent = bits.join(" · ");
     chip.appendChild(sub);
     if (p.batt > 0.5) {
@@ -936,8 +1048,11 @@ function drawRoster() {
       batt.textContent = onUsb ? `🔌 ${p.batt} V` : `🔋 ${p.batt} V${low ? " ⚠" : ""}`;
       chip.appendChild(batt);
     }
-    chip.title = (p.lat !== undefined ? `${name}: ${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}` : name)
-               + " — click for details";
+    const tip = [name];
+    if (p.lat !== undefined) tip.push(`${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`);
+    if (p.alt !== undefined) tip.push(`alt ${p.alt} m`);
+    if (p.temp !== undefined) tip.push(`${p.temp} °C board`);
+    chip.title = tip.join(" · ") + " — click for details";
     els.roster.appendChild(chip);
   }
 }
@@ -953,6 +1068,34 @@ function niceScale(m) {
   const steps = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000];
   for (const s of steps) if (m <= s) return s;
   return Math.ceil(m / 100000) * 100000;
+}
+
+// Hover tooltip text for a radar node: name · distance/bearing · altitude · age ·
+// battery · signal · board temp (whatever is known).
+function radarTipFor(name, p) {
+  const now = Date.now();
+  const bits = [name];
+  if (p.lat !== undefined && myPos)
+    bits.push(`${fmtDistance(haversineM(myPos, p))} ${fmtBearing(bearingDeg(myPos, p))}`);
+  else if (p.lat !== undefined) bits.push("has GPS");
+  if (p.alt !== undefined) bits.push(`alt ${p.alt} m`);
+  bits.push(fmtAge(now - p.ts));
+  if (p.posTs && p.ts - p.posTs > POS_STALE_MS) bits.push(`pos ${fmtAge(now - p.posTs, true)} old`);
+  if (p.batt > 0.5) bits.push(p.batt > 4.3 ? `${p.batt} V USB` : `${p.batt} V`);
+  if (p.rssi !== undefined) bits.push(`${p.rssi} dBm`);
+  if (p.temp !== undefined) bits.push(`${p.temp} °C board`);
+  return bits.join(" · ");
+}
+function selfRadarTip() {
+  const m = myGps;
+  const bits = [(myName || "You") + " (you)"];
+  const state = gpsState();
+  if (m && m.alt !== undefined && state === "live") bits.push(`alt ${m.alt} m`);
+  else if (myPos && myPos.alt !== undefined) bits.push(`alt ${myPos.alt} m · last known`);
+  if (m && +m.batt > 0.5) bits.push(m.batt > 4.3 ? `${m.batt} V USB` : `${m.batt} V`);
+  if (m && m.temp !== undefined) bits.push(`${(+m.temp).toFixed(1)} °C board`);
+  if (SHOW_HEADING && m && m.hdg !== undefined) bits.push(`facing ${fmtBearing(m.hdg)} · magnetic, approx`);
+  return bits.join(" · ");
 }
 
 function drawRadar() {
@@ -1050,8 +1193,11 @@ function drawRadar() {
   // (its own avatar colour) when we have no fix
   const centerColor = nodeColor(refName, refIsSelf);
   accCircle(svg, C, C, refHacc, centerColor);
-  svg.appendChild(svgEl("circle", { cx: C, cy: C, r: 4.5,
-    style: `fill:${centerColor}` + (fixLost ? ";opacity:.4" : "") }));
+  const centerDot = svgEl("circle", { cx: C, cy: C, r: 4.5,
+    style: `fill:${centerColor}` + (fixLost ? ";opacity:.4" : "") });
+  centerDot.appendChild(svgEl("title", {},
+    refIsSelf ? selfRadarTip() : radarTipFor(refName, peers.get(refName))));
+  svg.appendChild(centerDot);
   if (refIsSelf && myGps && +myGps.speed > 2 && myGps.course !== undefined) {
     const ca = myGps.course * Math.PI / 180;
     svg.appendChild(svgEl("line", {
@@ -1059,6 +1205,19 @@ function drawRadar() {
       x2: C + Math.sin(ca) * 15, y2: C - Math.cos(ca) * 15,
       style: `stroke:${centerColor};stroke-width:2.5;stroke-linecap:round`,
     }));
+  }
+  // Compass heading tick (fw 1.8): which way the board physically faces. Drawn as
+  // a short DASHED hollow arrow, visually distinct from the solid GPS-course line
+  // above, and always present (a still board still has a heading).
+  if (refIsSelf && SHOW_HEADING && myGps && myGps.hdg !== undefined) {
+    const ha = myGps.hdg * Math.PI / 180;
+    const tick = svgEl("line", {
+      x1: C + Math.sin(ha) * 5,  y1: C - Math.cos(ha) * 5,
+      x2: C + Math.sin(ha) * 19, y2: C - Math.cos(ha) * 19,
+      style: `stroke:${centerColor};stroke-width:1.5;stroke-dasharray:2 2;opacity:.85`,
+    });
+    tick.appendChild(svgEl("title", {}, `board facing ${fmtBearing(myGps.hdg)} · magnetic, approx`));
+    svg.appendChild(tick);
   }
   if (!refIsSelf)
     svg.appendChild(svgEl("text", { x: C, y: C - 9, "text-anchor": "middle",
@@ -1070,8 +1229,9 @@ function drawRadar() {
     const x = C + Math.sin(b * Math.PI / 180) * r;
     const y = C - Math.cos(b * Math.PI / 180) * r;
     const age = now - p.ts;
-    const g = svgEl("g", { opacity: age > 120000 ? 0.5 : 1 });
+    const g = svgEl("g", { opacity: age > OVERDUE_MS ? 0.5 : 1 });
     g.style.cursor = "pointer";
+    g.appendChild(svgEl("title", {}, radarTipFor(name, p)));   // hover details
     g.addEventListener("click", () => focusPeer(name));
     // breadcrumb trail: where they've been, fading behind the dot
     if (p.trail.length) {
@@ -1096,8 +1256,19 @@ function drawRadar() {
     }
     g.appendChild(svgEl("text", { x, y: y - 9, "text-anchor": "middle",
       style: "fill:var(--text);font-size:11px;font-weight:600" }, name));
-    const sub = fmtDistance(d) + (age > 60000 ? ` · ${Math.round(age / 60000)} min ago` : "");
+    // Sub-label: distance + freshness. Position age (posTs) ≠ presence age (ts):
+    // a fixless-but-beaconing peer is "alive" but its dot sits at an old spot.
+    let sub = fmtDistance(d);
+    if (p.posTs && p.ts - p.posTs > POS_STALE_MS) sub += ` · pos ${fmtAge(now - p.posTs, true)} old`;
+    else if (age > 60000) sub += ` · ${fmtAge(age)}`;
     g.appendChild(svgEl("text", { x, y: y + 17, "text-anchor": "middle", style: label }, sub));
+    // Altitude tag when meaningfully above/below you (fw 1.8 altitude everywhere).
+    if (myPos && myPos.alt !== undefined && p.alt !== undefined) {
+      const dAlt = p.alt - myPos.alt;
+      if (Math.abs(dAlt) >= 25)
+        g.appendChild(svgEl("text", { x, y: y + 27, "text-anchor": "middle", style: label },
+          `${dAlt > 0 ? "▲" : "▼"} ${Math.abs(dAlt)} m`));
+    }
     svg.appendChild(g);
   }
 
@@ -1112,7 +1283,8 @@ function drawRadar() {
       const d = Math.hypot(t.x, t.y), b = (Math.atan2(t.x, t.y) * 180 / Math.PI + 360) % 360;
       const r = Math.min(d / scale, 1) * R;
       drawEstNode(svg, C + Math.sin(b * Math.PI / 180) * r, C - Math.cos(b * Math.PI / 180) * r,
-                  nm, meshResult.sigma, scale, R, nodeColor(nm, nm === meshResult.meName));
+                  nm, meshResult.sigma, scale, R, nodeColor(nm, nm === meshResult.meName),
+                  (peers.has(nm) ? radarTipFor(nm, peers.get(nm)) : nm) + " · RSSI estimate");
       estCount++;
     }
   }
@@ -1178,11 +1350,26 @@ function lipoPct(v) {
   return 100;
 }
 // Battery label: USB/charging above 4.3 V, else volts + LiPo % + trend + low.
-function fmtBatt(v, withTrend) {
+// `trend` is a pre-computed arrow suffix (" ↗"/" ↘"/"") so this works for both
+// the own board (battHist) and any peer (its own per-peer history).
+function fmtBatt(v, trend) {
   if (!(v > 0.5)) return DASH;
-  const trend = withTrend ? battTrendArrow() : "";
+  trend = trend || "";
   if (v > 4.3) return `${v} V · USB/charging`;
   return `${v} V · ~${lipoPct(v)}%${trend}${v < LOW_BATT_V ? " · low" : ""}`;
+}
+
+// Own barometric-pressure trend over the session (~60 min window). A steady fall
+// is the classic "weather turning" cue; returns an arrow + a plain-language tip.
+function pressTrend() {
+  if (pressHist.length < 2) return { arrow: "", tip: "Barometric pressure" };
+  const first = pressHist[0], last = pressHist[pressHist.length - 1];
+  const span = last.t - first.t;
+  if (span < 20 * 60000) return { arrow: "", tip: "Barometric pressure · trend building…" };
+  const perHr = (last.v - first.v) / (span / 3600000);
+  if (perHr <= -1.5) return { arrow: " ↘", tip: `Falling ${perHr.toFixed(1)} hPa/h — weather may be turning` };
+  if (perHr >= 1.5)  return { arrow: " ↗", tip: `Rising +${perHr.toFixed(1)} hPa/h — weather settling` };
+  return { arrow: "", tip: `Steady (${perHr >= 0 ? "+" : ""}${perHr.toFixed(1)} hPa/h)` };
 }
 
 // "Sky view": a plain-language read on GPS quality from data the board already
@@ -1230,6 +1417,7 @@ function signalWord(snr) {
 let telemBuilt = false;
 const telemEls = {};
 let mineCoords = null;   // current "my board" coords for click-to-copy
+let peerCoords = null;   // current focused-peer coords for click-to-copy
 const DASH = "—";
 
 function thRow(parent, label, title) {
@@ -1253,7 +1441,34 @@ function thHead(parent) {
   const sub = document.createElement("span"); sub.className = "sub";
   h.append(dot, main, sub);
   parent.appendChild(h);
-  return { dot, main, sub };
+  return { dot, main, sub, el: h };
+}
+
+// A Position row body: a Google-Maps link (primary action) + a small copy glyph.
+// `getCoords` returns the current "lat,lon" string (7dp) for the clipboard, or
+// null when unknown. Built once; only the link text/href + copy visibility
+// change, keeping the panel stable. Mirrors the original "my board" position row.
+function makePosRow(vEl, getCoords) {
+  const link = document.createElement("a");
+  link.target = "_blank"; link.rel = "noopener";
+  link.style.color = "var(--accent)";
+  link.textContent = DASH;
+  const copy = document.createElement("span");
+  copy.className = "copybtn";
+  copy.textContent = " ⧉";
+  copy.title = "Copy coordinates";
+  copy.style.cursor = "pointer";
+  copy.style.display = "none";
+  copy.addEventListener("click", () => {
+    const c = getCoords();
+    if (c && navigator.clipboard) {
+      navigator.clipboard.writeText(c);
+      copy.textContent = " ✓";
+      setTimeout(() => { copy.textContent = " ⧉"; }, 1200);
+    }
+  });
+  vEl.replaceChildren(link, copy);
+  return { link, copy };
 }
 
 function setHead(parts, cls, mainText, subText) {
@@ -1317,29 +1532,16 @@ function buildTelemSkeleton() {
     "How open/spread the board's view of the sky is — drives GPS accuracy");
   telemEls.mineSats = thRow(mine, "Sats", "Satellites used in the fix / tracked in view");
   telemEls.minePos = thRow(mine, "Position", "Tap to open in a map · ⧉ to copy");
-  // Coords as a map link (primary action) + a small copy glyph. Nodes are built
-  // once and only their text/href update, keeping the panel stable.
-  telemEls.minePosLink = document.createElement("a");
-  telemEls.minePosLink.target = "_blank";
-  telemEls.minePosLink.rel = "noopener";
-  telemEls.minePosLink.style.color = "var(--accent)";
-  telemEls.minePosLink.textContent = DASH;
-  telemEls.minePosCopy = document.createElement("span");
-  telemEls.minePosCopy.className = "copybtn";
-  telemEls.minePosCopy.textContent = " ⧉";
-  telemEls.minePosCopy.title = "Copy coordinates";
-  telemEls.minePosCopy.style.cursor = "pointer";
-  telemEls.minePosCopy.style.display = "none";
-  telemEls.minePosCopy.addEventListener("click", () => {
-    if (mineCoords && navigator.clipboard) {
-      navigator.clipboard.writeText(mineCoords);
-      telemEls.minePosCopy.textContent = " ✓";
-      setTimeout(() => { telemEls.minePosCopy.textContent = " ⧉"; }, 1200);
-    }
-  });
-  telemEls.minePos.replaceChildren(telemEls.minePosLink, telemEls.minePosCopy);
+  // Coords as a map link (primary action) + a small copy glyph, built once.
+  const minePosRow = makePosRow(telemEls.minePos, () => mineCoords);
+  telemEls.minePosLink = minePosRow.link;
+  telemEls.minePosCopy = minePosRow.copy;
   telemEls.mineSpeed = thRow(mine, "Speed");
   telemEls.mineBatt  = thRow(mine, "Battery", "Trend arrow: charging/draining over the last 10 min");
+  telemEls.mineTemp  = thRow(mine, "Board temp",
+    "BMP180 reads the board itself, not the air — a sun-lit unit runs above ambient, which is the number that matters for solar charging");
+  telemEls.minePress = thRow(mine, "Pressure",
+    "Barometric pressure. A steady fall over ~an hour often means weather turning");
   thSub(mine, "Diagnostics");
   telemEls.mineUtc   = thRow(mine, "Satellite clock", "GPS-synced UTC time from the board");
   telemEls.mineUp    = thRow(mine, "Uptime");
@@ -1348,34 +1550,57 @@ function buildTelemSkeleton() {
   telemEls.mineChan  = thRow(mine, "Noise floor", "Idle RX noise floor — lower is a quieter channel");
 
   // Mesh positioning section (RSSI trilateration + GPS anchoring/calibration).
+  // The headline stays visible; the numeric detail rows collapse to declutter.
   const ms = els.telemMesh;
   ms.replaceChildren();
   telemEls.meshHead   = thHead(ms);
-  telemEls.meshNodes  = thRow(ms, "Nodes", "Units in the mesh: you + every peer heard");
-  telemEls.meshLinks  = thRow(ms, "Links", "Pairwise radio links (yours + neighbour reports) used to triangulate");
-  telemEls.meshAnchor = thRow(ms, "Anchoring", "How the relative constellation is pinned to real coordinates");
-  telemEls.meshCal    = thRow(ms, "Calibration", "RSSI→distance model (path-loss exponent n, ref power P0). Auto-fits when ≥2 nodes have GPS.");
+  const meshDet = document.createElement("details");
+  const meshSum = document.createElement("summary");
+  meshSum.className = "detsum"; meshSum.textContent = "details";
+  meshDet.append(meshSum);
+  ms.appendChild(meshDet);
+  telemEls.meshNodes  = thRow(meshDet, "Nodes", "Units in the mesh: you + every peer heard");
+  telemEls.meshLinks  = thRow(meshDet, "Links", "Pairwise radio links (yours + neighbour reports) used to triangulate");
+  telemEls.meshAnchor = thRow(meshDet, "Anchoring", "How the relative constellation is pinned to real coordinates");
+  // Calibration (path-loss n / P0) moved to the headline tooltip — see renderMeshTelem.
 
   const pp = els.telemPeer;
   pp.replaceChildren();
   telemEls.peerHead = thHead(pp);
-  // Battery first: for a remote tracker, "is it alive / charged" matters more
-  // than link quality.
-  telemEls.peerBatt   = thRow(pp, "Battery");
+  // Battery + board temp first: for a remote tracker, "is it alive / charging"
+  // matters more than link quality (temp answers "is the sun on it?").
+  telemEls.peerBatt   = thRow(pp, "Battery", "Trend arrow: charging/draining over the last 10 min");
+  telemEls.peerTemp   = thRow(pp, "Board temp",
+    "The peer board's own temperature (BMP180). A solar unit charging in the sun reads well above ambient. Trend arrow = warming/cooling.");
   telemEls.peerSignal = thRow(pp, "Signal", "Radio link quality of the last packet heard");
   telemEls.peerMoving = thRow(pp, "Moving");
   telemEls.peerClient = thRow(pp, "App", "What the peer is chatting from (sent once on join)");
   thSub(pp, "Diagnostics");
   telemEls.peerFix    = thRow(pp, "GPS", "The peer's own fix quality and accuracy");
-  telemEls.peerAlt    = thRow(pp, "Elevation", "Height relative to your board");
+  telemEls.peerAlt    = thRow(pp, "Altitude", "Absolute altitude (m above sea level) and height relative to your board");
+  telemEls.peerFacing = thRow(pp, "Facing",
+    "Which way the board points — magnetic · approx (no tilt compensation or declination; needs a one-time rotation to self-calibrate)");
+  telemEls.peerPos    = thRow(pp, "Position", "Tap to open in a map · ⧉ to copy");
+  const peerPosRow = makePosRow(telemEls.peerPos, () => peerCoords);
+  telemEls.peerPosLink = peerPosRow.link;
+  telemEls.peerPosCopy = peerPosRow.copy;
+  telemEls.peerRestarts = thRow(pp, "Restarts",
+    "Times this peer's board power-cycled this session (new random id each boot) — repeated restarts hint at brown-outs");
+  telemEls.peerRestarts.parentElement.style.display = "none";   // shown only when > 0
   telemEls.peerTrail  = thRow(pp, "Path", "Recent breadcrumb positions on the radar");
 
+  // "This device" (local browser info) — collapse the whole section behind its
+  // own headline to declutter; the headline (presence + browser/OS) stays visible.
   const br = els.telemBrowser;
   br.replaceChildren();
-  telemEls.brHead    = thHead(br);
-  telemEls.brWindow  = thRow(br, "Window");
-  telemEls.brTheme   = thRow(br, "Theme");
-  telemEls.brClock   = thRow(br, "Local time");
+  const brDet = document.createElement("details");
+  const brSum = document.createElement("summary");
+  brDet.appendChild(brSum);
+  br.appendChild(brDet);
+  telemEls.brHead    = thHead(brSum);          // headline lives in the summary
+  telemEls.brWindow  = thRow(brDet, "Window");
+  telemEls.brTheme   = thRow(brDet, "Theme");
+  telemEls.brClock   = thRow(brDet, "Local time");
   fillBrowserStatic();
 }
 
@@ -1470,12 +1695,17 @@ function renderMeshTelem() {
   if (!telemEls.meshHead) return;
   const r = meshResult;
   const calTxt = c => c ? `n=${c.n.toFixed(2)} · P0=${Math.round(c.p0)} dBm` : DASH;
+  // Path-loss calibration (n / P0) now lives in the headline tooltip, not a row.
+  const setCalTip = (c, calibrated) => {
+    telemEls.meshHead.el.title = `RSSI→distance model: ${calTxt(c)} · `
+      + (calibrated ? "auto-calibrated from GPS pairs" : "default (needs ≥2 GPS nodes to calibrate)");
+  };
   if (!r || r.mode === "none" || !r.nodeCount || r.nodeCount < 2 || !r.linkCount) {
     setHead(telemEls.meshHead, "", "Mesh idle", r && r.nodeCount > 1 ? "no links yet" : "need ≥2 nodes");
     telemEls.meshNodes.textContent = r && r.nodeCount ? `${r.nodeCount}` : DASH;
     telemEls.meshLinks.textContent = r && r.linkCount !== undefined ? `${r.linkCount}` : DASH;
     telemEls.meshAnchor.textContent = DASH;
-    telemEls.meshCal.textContent = calTxt(r && r.cal) + (r && r.calibrated ? " · calibrated" : " · default");
+    setCalTip(r && r.cal, r && r.calibrated);
     return;
   }
   const word = r.mode === "anchored" ? "Anchored to GPS"
@@ -1488,7 +1718,7 @@ function renderMeshTelem() {
       r.mode === "anchored"  ? `${r.anchors} GPS refs · fit rms ±${Math.round(r.rms)} m`
     : r.mode === "anchored1" ? "1 GPS ref · position only, bearing unknown"
     :                          "no GPS · orientation arbitrary";
-  telemEls.meshCal.textContent = calTxt(r.cal) + (r.calibrated ? " · calibrated" : " · default");
+  setCalTip(r.cal, r.calibrated);
 }
 
 function renderTelemetry() {
@@ -1559,7 +1789,15 @@ function renderTelemetry() {
       : DASH;
   telemEls.mineUtc.textContent =
     m && m.utc ? m.utc.replace("T", " ").replace("Z", "") : DASH;
-  telemEls.mineBatt.textContent = m ? fmtBatt(+m.batt, true) : DASH;
+  telemEls.mineBatt.textContent = m ? fmtBatt(+m.batt, battTrendArrow()) : DASH;
+  telemEls.mineTemp.textContent = m && m.temp !== undefined ? `${(+m.temp).toFixed(1)} °C` : DASH;
+  if (m && m.press !== undefined) {
+    const pt = pressTrend();
+    telemEls.minePress.textContent = `${(+m.press).toFixed(1)} hPa${pt.arrow}`;
+    telemEls.minePress.parentElement.title = pt.tip;
+  } else {
+    telemEls.minePress.textContent = DASH;
+  }
   telemEls.mineUp.textContent = m && m.up !== undefined ? fmtUptime(m.up) : DASH;
   telemEls.minePkts.textContent = m && m.tx !== undefined ? `${m.tx} sent · ${m.rx} received` : DASH;
   telemEls.mineSave.textContent =
@@ -1578,22 +1816,36 @@ function renderTelemetry() {
 
   if (!name) {
     setHead(telemEls.peerHead, "", "No peers heard yet", "");
-    for (const k of ["peerMoving","peerFix","peerAlt","peerBatt","peerSignal","peerTrail","peerClient"])
+    for (const k of ["peerMoving","peerFix","peerAlt","peerFacing","peerBatt","peerTemp","peerSignal","peerTrail","peerClient"])
       telemEls[k].textContent = DASH;
+    peerCoords = null;
+    telemEls.peerPosLink.textContent = DASH;
+    telemEls.peerPosLink.removeAttribute("href");
+    telemEls.peerPosCopy.style.display = "none";
+    telemEls.peerRestarts.parentElement.style.display = "none";
     return;
   }
   const p = peers.get(name);
-  const stale = now - p.ts > 120000;
+  const silent = now - p.ts;
+  const overdue = silent > OVERDUE_MS;
+  const quiet = silent > QUIET_MS;
+  // Presence age (last heard) drives the dot; position age is reported separately
+  // (a heartbeating-but-fixless peer is alive with a stale position).
+  const posOld = p.posTs && p.ts - p.posTs > POS_STALE_MS;
+  let ageSub = quiet ? `quiet · last heard ${fmtAge(silent)}`
+             : overdue ? `overdue · ${fmtAge(silent)}`
+             : fmtAge(silent);
+  if (posOld) ageSub += ` · pos ${fmtAge(now - p.posTs, true)} old`;
+  const headCls = quiet ? "bad" : overdue ? "warn" : "good";
 
   if (p.lat !== undefined && myPos) {
-    setHead(telemEls.peerHead, stale ? "warn" : "good",
-            `${fmtDistance(haversineM(myPos, p))} ${fmtBearing(bearingDeg(myPos, p))}`,
-            fmtAge(now - p.ts));
+    setHead(telemEls.peerHead, headCls,
+            `${fmtDistance(haversineM(myPos, p))} ${fmtBearing(bearingDeg(myPos, p))}`, ageSub);
   } else if (p.lat !== undefined) {
-    setHead(telemEls.peerHead, "", `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`,
-            "no local fix to compare");
+    setHead(telemEls.peerHead, quiet ? "bad" : overdue ? "warn" : "",
+            `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`, ageSub);
   } else {
-    setHead(telemEls.peerHead, "warn", "No position yet", fmtAge(now - p.ts));
+    setHead(telemEls.peerHead, quiet ? "bad" : "warn", "No position yet", ageSub);
   }
   // Low battery on a remote tracker is critical — escalate the dot + note it.
   if (+p.batt > 0.5 && +p.batt <= 4.3 && +p.batt < LOW_BATT_V) {
@@ -1612,15 +1864,25 @@ function renderTelemetry() {
   } else {
     telemEls.peerFix.textContent = DASH;
   }
-  // Elevation relative to you: "12 m above you" / "8 m below you" / "about level".
-  if (p.alt !== undefined && myPos && myPos.alt !== undefined) {
-    const dAlt = p.alt - myPos.alt;
-    telemEls.peerAlt.textContent = Math.abs(dAlt) < 10 ? "about level"
-      : `${Math.abs(dAlt)} m ${dAlt > 0 ? "above you" : "below you"}`;
+  // Altitude: absolute (m above sea level) + height relative to you when known.
+  if (p.alt !== undefined) {
+    let s = `${p.alt} m`;
+    if (myPos && myPos.alt !== undefined) {
+      const dAlt = p.alt - myPos.alt;
+      s += Math.abs(dAlt) < 10 ? " (about level)"
+         : ` (${Math.abs(dAlt)} m ${dAlt > 0 ? "above you" : "below you"})`;
+    }
+    telemEls.peerAlt.textContent = s;
   } else {
     telemEls.peerAlt.textContent = DASH;
   }
-  telemEls.peerBatt.textContent = fmtBatt(+p.batt, false);
+  // Facing: magnetic heading word (approx). Hidden entirely if SHOW_HEADING is off.
+  telemEls.peerFacing.textContent =
+    SHOW_HEADING && p.hdg !== undefined ? `${fmtBearing(p.hdg)} · magnetic` : DASH;
+  telemEls.peerBatt.textContent = fmtBatt(+p.batt, trendArrow(p.battHist, 3 * 60000, 0.04));
+  // Board temp + warming/cooling trend (answers "is the sun charging it?").
+  telemEls.peerTemp.textContent =
+    p.temp !== undefined ? `${p.temp} °C${trendArrow(p.tempHist, 2 * 60000, 1)}` : DASH;
   // Signal: lead with the plain word, dBm after; SNR detail in the tooltip.
   if (p.rssi !== undefined) {
     const sw = signalWord(p.snr);
@@ -1628,6 +1890,26 @@ function renderTelemetry() {
     telemEls.peerSignal.title = `RSSI ${p.rssi} dBm · SNR ${p.snr} dB`;
   } else {
     telemEls.peerSignal.textContent = DASH;
+  }
+  // Position row: map link + copy (mirrors the "my board" row).
+  if (p.lat !== undefined) {
+    peerCoords = `${p.lat.toFixed(7)},${p.lon.toFixed(7)}`;
+    telemEls.peerPosLink.textContent =
+      `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}` + (posOld ? " · last known" : "");
+    telemEls.peerPosLink.href = `https://www.google.com/maps?q=${peerCoords}`;
+    telemEls.peerPosCopy.style.display = "";
+  } else {
+    peerCoords = null;
+    telemEls.peerPosLink.textContent = DASH;
+    telemEls.peerPosLink.removeAttribute("href");
+    telemEls.peerPosCopy.style.display = "none";
+  }
+  // Restart counter (shown only when a reboot was seen this session).
+  if (p.reboots) {
+    telemEls.peerRestarts.parentElement.style.display = "";
+    telemEls.peerRestarts.textContent = `${p.reboots}× this session`;
+  } else {
+    telemEls.peerRestarts.parentElement.style.display = "none";
   }
   telemEls.peerTrail.textContent = p.trail.length ? `${p.trail.length + 1} recent spots` : DASH;
   telemEls.peerClient.textContent = p.client || DASH;
@@ -1832,6 +2114,10 @@ function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore })
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
+  // Per-message signal tooltip on incoming bubbles (live rx only — restored
+  // history has no RSSI): "−87 dBm · SNR 5.5".
+  if (!mine && rssi !== undefined)
+    bubble.title = `${rssi} dBm${snr !== undefined ? ` · SNR ${snr}` : ""}`;
   const btext = document.createElement("span");
   btext.className = "btext";
   btext.textContent = text;
@@ -1864,7 +2150,10 @@ function addMessage({ mine, from, text, rssi, snr, id, pos, time, ts, restore })
 
   if (mine && !restore && id !== undefined) {
     bubblesById.set(id, { statusEl, bmetaEl: bmeta, time: when, text, done: false });
-    bmeta.addEventListener("click", () => retrySend(id, bmeta));
+    // ONE persistent click handler; retrySend repoints bmeta._msgId instead of
+    // stacking a new listener per retry (previously leaked a listener each time).
+    bmeta._msgId = id;
+    bmeta.addEventListener("click", () => retrySend(bmeta._msgId, bmeta));
   }
   if (!restore) saveHistory({ mine, from, text, time: when, ts: msgTs, pos });
 
@@ -1913,12 +2202,12 @@ function retrySend(oldId, bmeta) {
   clearAckTimer(oldId);
   const id = ++webMsgId;
   bubblesById.set(id, b);
+  bmeta._msgId = id;                 // repoint the single existing click handler
   bmeta.classList.remove("retry");
   if (b.statusEl) {
     b.statusEl.textContent = RECEIPT.sending;
     b.statusEl.title = RECEIPT_TIPS[RECEIPT.sending];
   }
-  bmeta.addEventListener("click", () => retrySend(id, bmeta), { once: false });
   writeLine({ t: "tx", id, text: b.text });
   armAckTimer(id);
 }
@@ -1977,6 +2266,10 @@ function handleBoardEvent(m) {
       if (m.batt > 0.5) {
         battHist.push({ t: Date.now(), v: +m.batt });
         while (battHist.length && Date.now() - battHist[0].t > BATT_HIST_MS) battHist.shift();
+      }
+      if (m.press !== undefined) {
+        pressHist.push({ t: Date.now(), v: +m.press });
+        while (pressHist.length && Date.now() - pressHist[0].t > PRESS_HIST_MS) pressHist.shift();
       }
       // Keep the last good fix through brief dropouts instead of blanking.
       if (m.fix) { myPos = { lat: m.lat, lon: m.lon, alt: m.alt }; myPosTs = Date.now(); lastFixTs = Date.now(); }
@@ -2138,6 +2431,7 @@ els.radarBtn.addEventListener("click", () => {
 setInterval(() => {
   if (!connected && !previewing) return;
   updateGpsPill();   // keep the "GPS lost · age" counter fresh
+  checkPeerAlerts(); // presence watchdog: "gone quiet" / low-battery lines
   if (radarOn) drawRadar();
   drawRoster();
   renderTelemetry();

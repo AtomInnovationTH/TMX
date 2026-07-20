@@ -1,6 +1,6 @@
 # 💬 LoRa Chat — off-grid browser chat with two LightTrackers
 
-**Version:** firmware **v1.7** · 923.2 MHz (AS923 Thailand)
+**Version:** firmware **v1.8** · 923.2 MHz (AS923 Thailand)
 
 **Open the chat app:** **https://atominnovationth.github.io/TMX/**
 *(enable Pages once: repo Settings → Pages → branch `main`, folder `/docs`)*
@@ -21,7 +21,25 @@ board, announces you to everyone in radio range, and you're chatting.
   own** from radio link strength, then pin that relative map onto real
   coordinates whenever any unit does have GPS (and auto-calibrate the
   distance model). Shown as hollow "~" markers with uncertainty halos.
+- **Environment telemetry** (fw 1.8): each board also reports its own
+  **temperature** and **barometric pressure** (BMP180) and an approximate
+  **magnetic heading** (LSM303DLHC). Board temperature is the solar-charging
+  health read (a unit in the sun runs above ambient); pressure gets a session
+  trend arrow (a steady fall hints at weather turning); altitude is shown
+  everywhere (absolute + relative to you), and the radar draws which way your
+  board faces.
+- **Presence heartbeat + silence alerts** (fw 1.8): every board beacons about
+  once a minute whether or not it has a GPS fix, so the roster always shows who
+  is alive with their battery voltage. The app turns a peer amber when it is
+  *overdue*, posts a "gone quiet" line if it stays silent past ~5 min (then an
+  "is back" line on recovery), flags a peer power-cycle ("restarted — possible
+  power loss") and one-shot low-battery crossings — the brown-out signals a
+  solar board sends but the app used to ignore.
 - Clean light/dark chat UI, join announcements, unplug/reconnect handling
+
+> **Use unique board names.** Peers are tracked by their display name, so two
+> boards sharing a name will merge into one dot/row on the radar, roster and
+> mesh. Give each board a distinct name (a labeled board sets its own).
 
 ## <a name="chat-setup"></a>Chat quick start
 
@@ -62,7 +80,9 @@ Browser ⇄ Web Serial (USB) ⇄ LightTracker ⇄ 923.2 MHz LoRa ⇄ LightTracke
   Chat and join frames carry a 12-byte position trailer (GPS lat/lon/alt,
   satellite count, battery); the header GPS pill shows your own fix status. The
   join frame also carries a tiny client/app profile (browser · OS · desktop) so
-  each side can see what the other is chatting from.
+  each side can see what the other is chatting from. A periodic presence beacon
+  (~60 s, fix or no fix) additionally carries the board's temperature, pressure
+  and magnetic heading (fw 1.8) plus a neighbour-RSSI slice for mesh positioning.
 - `docs/index.html` — the whole app in a single file. Vanilla JS, zero
   dependencies, zero external requests, works offline once loaded.
 
