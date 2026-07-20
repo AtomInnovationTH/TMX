@@ -362,6 +362,9 @@
 const MAX_TEXT = 180;
 const LIGHTTRACKER_VID = 0x2A03;
 const LOW_BATT_V = 3.5;   // LiPo getting low — surface it
+// Low battery gate: on battery (not the >4.3 V USB rail) and below the threshold.
+// Shared by the presence-watchdog alert and the telemetry status dot so they agree.
+const isLowBatt = v => +v > 0.5 && +v <= 4.3 && +v < LOW_BATT_V;
 
 const $ = id => document.getElementById(id);
 const els = {
@@ -616,7 +619,6 @@ function notePeer(from, pos, rssi, snr, ext, client, id, nb) {
   if (ext) {
     p.ext = ext;
     if (ext.temp !== undefined) { p.temp = +ext.temp; pushTrend(p.tempHist, +ext.temp, now); }
-    if (ext.press !== undefined) p.press = +ext.press;
     if (ext.hdg !== undefined) p.hdg = +ext.hdg;   // keep last known heading
   }
   if (client) p.client = client;
@@ -697,7 +699,7 @@ function checkPeerAlerts() {
       addSystem(`${name} has gone quiet — last heard ${fmtAge(silent)}`
                 + (bits.length ? ` (last ${bits.join(", ")})` : ""));
     }
-    if (p.batt > 0.5 && p.batt <= 4.3 && p.batt < LOW_BATT_V && !p.lowBattNotified) {
+    if (isLowBatt(p.batt) && !p.lowBattNotified) {
       p.lowBattNotified = true;
       addSystem(`${name} battery low — ${p.batt} V`);
     } else if (p.batt >= LOW_BATT_V + 0.1) {
@@ -1845,10 +1847,10 @@ function renderTelemetry() {
     setHead(telemEls.peerHead, quiet ? "bad" : overdue ? "warn" : "",
             `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`, ageSub);
   } else {
-    setHead(telemEls.peerHead, quiet ? "bad" : "warn", "No position yet", ageSub);
+    setHead(telemEls.peerHead, quiet ? "bad" : overdue ? "warn" : "", "No position yet", ageSub);
   }
   // Low battery on a remote tracker is critical — escalate the dot + note it.
-  if (+p.batt > 0.5 && +p.batt <= 4.3 && +p.batt < LOW_BATT_V) {
+  if (isLowBatt(p.batt)) {
     telemEls.peerHead.dot.className = "tdot bad";
     const s = telemEls.peerHead.sub;
     s.textContent += (s.textContent ? " · " : "") + "🔋 low";

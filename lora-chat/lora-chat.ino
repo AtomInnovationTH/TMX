@@ -949,7 +949,11 @@ void setup() {
 
   // Environment sensors (optional — fw 1.8). Both are non-fatal: a missing chip
   // just omits its telemetry fields, exactly like gpsOK/displayOK.
-  bmpOK = bmp.begin();                // BMP180 temp/pressure (I2C 0x77)
+  bmpOK = bmp.begin(BMP085_STANDARD);  // BMP180 temp/pressure (I2C 0x77). STANDARD
+                                       // oversampling: the pressure conversion in
+                                       // the 2 s poll is ~8 ms, not the ~26 ms of
+                                       // the default ULTRAHIGHRES — board temp for
+                                       // "is the sun on it" needs no more.
   magOK = magInit();                  // LSM303DLHC magnetometer (I2C 0x1E)
 
   // Radio — field-verified LightTracker settings
